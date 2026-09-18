@@ -163,6 +163,16 @@ public class ModelChecker extends AbstractChecker
             {
                 report("exception in init");
                 report(e);
+                // Call-stack replay below is diagnostic only.  It can complete without
+                // reproducing the exception when the first pass has already recorded the
+                // initial state (for example, before liveness evaluation fails).  Retain
+                // the original error code as the fallback when replay succeeds.
+                final int initialErrorCode;
+                if (e instanceof Assert.TLCRuntimeException) {
+                    initialErrorCode = ((Assert.TLCRuntimeException) e).errorCode;
+                } else {
+                    initialErrorCode = EC.GENERAL;
+                }
                 // Initial state computation fails with an exception:
                 String msg = e.getMessage();
                 /**
@@ -189,17 +199,23 @@ public class ModelChecker extends AbstractChecker
 
                 // Replay the error with the error stack recorded:
                 final CallStackTool cTool = new CallStackTool(this.tool);
+                boolean replayFailed = false;
                 try
                 {
                     numberOfInitialStates = 0;
                     // SZ Feb 23, 2009: ignore cancel on error reporting
 					this.doInit(cTool, true);
                 } catch (FingerprintException fe){
+                    replayFailed = true;
 					result = MP.printError(EC.TLC_FINGERPRINT_EXCEPTION, new String[] {
 							cTool.hasCallStack() ? cTool.toString() : fe.getTrace(), fe.getRootCause().getMessage() });
                 } catch (Throwable e1) {
+                    replayFailed = true;
                     // Assert.printStack(e);
                     result = MP.printError(EC.TLC_NESTED_EXPRESSION, cTool.toString());
+                }
+                if (!replayFailed) {
+                    result = initialErrorCode;
                 }
                 this.printSummary(false, startTime);
                 this.cleanup(false);
