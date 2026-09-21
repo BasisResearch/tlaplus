@@ -393,6 +393,26 @@ public final class GraphStore implements IStateWriter {
 		return out;
 	}
 
+	/** The initial states' fingerprints, in the order they were written. */
+	public synchronized long[] initialFingerprints() {
+		final long[] out = new long[initial.size()];
+		for (int i = 0; i < out.length; i++) {
+			out[i] = initial.get(i);
+		}
+		return out;
+	}
+
+	/** The variable names the stored states were written with, in order. */
+	public synchronized String[] variableNames() {
+		final TLCState e = empty();
+		final tla2sany.semantic.OpDeclNode[] vars = e.getVars();
+		final String[] out = new String[vars.length];
+		for (int i = 0; i < vars.length; i++) {
+			out[i] = vars[i].getName().toString();
+		}
+		return out;
+	}
+
 	public synchronized long states() {
 		return index.size();
 	}

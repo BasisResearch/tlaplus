@@ -186,6 +186,18 @@ public final class Recorder implements IMessagePrinterRecorder {
 		}
 	}
 
+	/** Forget every counterexample and verdict, for a run that starts over. */
+	public synchronized void reset() {
+		messages.clear();
+		trace = null;
+		finishedTrace = null;
+		traces.clear();
+		violationCounts.clear();
+		finalStats = null;
+		outcome = EC.NO_ERROR;
+		outcomeProperty = null;
+	}
+
 	/** The messages recorded so far, oldest first, and forget them. */
 	public synchronized JsonArray drainMessages() {
 		final JsonArray out = new JsonArray();

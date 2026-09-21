@@ -99,6 +99,13 @@ public final class Resident {
 	private Tool tool;
 	private GraphStore store;
 	private ModelChecker checker;
+	/** True after an incremental refresh: the store is current, the checker is not. */
+	private boolean refreshed;
+	private String specDir;
+	private String mainFile;
+	private String configName;
+	private int workers;
+	private boolean checkDeadlock;
 	private Thread checkerThread;
 	private String metadir;
 	private volatile Integer resultCode;
@@ -183,6 +190,8 @@ public final class Resident {
 			return screen(request);
 		case "guard_profile":
 			return guardProfile();
+		case "refresh":
+			return refresh(request);
 		case "coverage": {
 			if (tool == null) {
 				return notOpen();
@@ -252,6 +261,10 @@ public final class Resident {
 
 		openedAt = System.currentTimeMillis();
 		recorder.drainMessages();
+		this.specDir = specDir;
+		this.mainFile = mainFile;
+		this.configName = config;
+		this.workers = workers;
 		try {
 			TLCGlobals.setNumWorkers(workers);
 			// Coverage is read into `static final` fields when ModelChecker and
@@ -263,6 +276,7 @@ public final class Resident {
 			tool = new FastTool(mainFile, config, new SimpleFilenameToStream(specDir), Tool.Mode.MC,
 					new HashMap<>());
 			final boolean checkDeadlock = deadlock && tool.getModelConfig().getCheckDeadlock();
+			this.checkDeadlock = checkDeadlock;
 			store = new GraphStore(metadir);
 			checker = new ModelChecker(tool, metadir, store, checkDeadlock, null,
 					FPSetFactory.getFPSetInitialized(new FPSetConfiguration(), metadir, specFile.getName()),
@@ -341,6 +355,10 @@ public final class Resident {
 	private JsonObject check(final JsonObject request) throws InterruptedException {
 		if (checker == null) {
 			return error(null, "not_open", "open a spec first");
+		}
+		if (refreshed) {
+			return error(null, "refreshed",
+					"this session was refreshed incrementally: its store is current and the store queries serve it, but TLC's own checker is not; open a new session for a full run");
 		}
 		final long budgetMs = request.has("budget_ms") ? request.get("budget_ms").getAsLong() : Long.MAX_VALUE;
 		final long budgetStates = request.has("budget_states") ? request.get("budget_states").getAsLong()
@@ -646,6 +664,135 @@ public final class Resident {
 	private String actionName(final long id) {
 		final Action a = store.action((int) id);
 		return a == null ? (id < 0 ? "<Initial predicate>" : "action#" + id) : a.getNameOfDefault();
+	}
+
+	/**
+	 * Re-parse the spec after an edit and re-explore only what the edit
+	 * reaches (see {@link Incremental}); a change to the variables, the
+	 * initial predicate or the config discards the store and starts over.
+	 */
+	private JsonObject refresh(final JsonObject request) throws Exception {
+		if (tool == null) {
+			return notOpen();
+		}
+		final long budgetMs = request.has("budget_ms") ? request.get("budget_ms").getAsLong() : 60_000L;
+		final boolean cont = request.has("continue") && request.get("continue").getAsBoolean();
+		final long started = System.currentTimeMillis();
+		if (checker != null && checkerThread != null && checkerThread.isAlive()) {
+			checker.stop();
+			checkerThread.join(10_000);
+		}
+		recorder.drainMessages();
+		final Tool oldTool = tool;
+		final GraphStore oldStore = store;
+		final Tool newTool;
+		try {
+			newTool = new FastTool(mainFile, configName, new SimpleFilenameToStream(specDir), Tool.Mode.MC,
+					new HashMap<>());
+		} catch (final Throwable t) {
+			final JsonObject reply = error(null, "parse_failed", t.toString());
+			reply.add("messages", recorder.drainMessages());
+			// The old tool and store stay in place.
+			return reply;
+		}
+		final Incremental.ActionDiff diff = Incremental.diff(oldTool, newTool, oldStore);
+		final JsonObject reply = ok();
+		reply.add("diff", Incremental.diffJson(diff));
+		reply.addProperty("front_end_ms", System.currentTimeMillis() - started);
+		if (diff.fullRerunReason != null || oldStore == null) {
+			// Nothing can be carried. A second checker in this JVM trips over
+			// TLC's per-process state (worker and trace bookkeeping), so the
+			// caller restarts the resident for the full run; the old tool
+			// and store stay in place until then.
+			reply.addProperty("mode", "full");
+			reply.addProperty("restart_required", true);
+			reply.addProperty("reason", diff.fullRerunReason != null ? diff.fullRerunReason : "nothing to carry");
+			return reply;
+		}
+		reply.addProperty("mode", "incremental");
+		final String newMetadir = FileUtil.makeMetaDir(new Date(System.currentTimeMillis()), specDir, null);
+		final GraphStore newStore = new GraphStore(newMetadir);
+		final Incremental.Result r = Incremental.replay(newTool, oldStore, newStore, diff, budgetMs, cont);
+		tool = newTool;
+		store = newStore;
+		metadir = newMetadir;
+		refreshed = true;
+		reply.addProperty("survivors", r.survivors);
+		reply.addProperty("dropped", r.dropped);
+		reply.addProperty("reexpanded", r.reexpanded);
+		reply.addProperty("new_states", r.newStates);
+		reply.addProperty("edges_copied", r.edgesCopied);
+		reply.addProperty("edges_generated", r.edgesGenerated);
+		reply.addProperty("budget_exhausted", r.budgetExhausted);
+		reply.addProperty("finished", !r.budgetExhausted && r.error == null);
+		if (r.error != null) {
+			reply.addProperty("error", r.error);
+		}
+		final JsonArray violations = new JsonArray();
+		for (final Incremental.Violation v : r.violations) {
+			final JsonObject o = new JsonObject();
+			o.addProperty("invariant", v.invariant);
+			o.addProperty("fp", v.fp);
+			o.addProperty("level", v.level);
+			violations.add(o);
+		}
+		// Per-invariant verdicts: exact over the refreshed store when the
+		// replay finished (one evaluation per state and invariant), else
+		// not_evaluated.
+		final JsonArray invs = new JsonArray();
+		final boolean finished = !r.budgetExhausted && r.error == null;
+		if (finished && (cont || r.violations.isEmpty())) {
+			final JsonArray exact = new JsonArray();
+			for (final Incremental.Sweep sw : Incremental.sweep(tool, store)) {
+				final JsonObject v = new JsonObject();
+				v.addProperty("name", sw.invariant);
+				if (sw.error != null) {
+					v.addProperty("verdict", "not_evaluable");
+					v.addProperty("error", sw.error);
+				} else if (sw.violations > 0) {
+					v.addProperty("verdict", "violated");
+					v.addProperty("reports", sw.violations);
+					v.addProperty("level", sw.firstLevel);
+					v.addProperty("fp", sw.firstFp);
+					final JsonObject o = new JsonObject();
+					o.addProperty("invariant", sw.invariant);
+					o.addProperty("fp", sw.firstFp);
+					o.addProperty("level", sw.firstLevel);
+					o.addProperty("count", sw.violations);
+					exact.add(o);
+				} else {
+					v.addProperty("verdict", "no_violation_found");
+				}
+				invs.add(v);
+			}
+			reply.add("violations", exact);
+		} else {
+			for (final String name : tool.getInvNames()) {
+				final JsonObject v = new JsonObject();
+				v.addProperty("name", name);
+				Incremental.Violation first = null;
+				for (final Incremental.Violation x : r.violations) {
+					if (x.invariant.equals(name)) {
+						first = x;
+						break;
+					}
+				}
+				if (first != null) {
+					v.addProperty("verdict", "violated");
+					v.addProperty("level", first.level);
+					v.addProperty("fp", first.fp);
+				} else {
+					v.addProperty("verdict", "not_evaluated");
+				}
+				invs.add(v);
+			}
+			reply.add("violations", violations);
+		}
+		reply.add("invariants", invs);
+		reply.addProperty("duration_ms", System.currentTimeMillis() - started);
+		reply.add("store", storeInfo());
+		reply.add("messages", recorder.drainMessages());
+		return reply;
 	}
 
 	/** The path from an initial state to a stored fingerprint. */
