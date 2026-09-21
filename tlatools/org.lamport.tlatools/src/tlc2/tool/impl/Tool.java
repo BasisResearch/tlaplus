@@ -1179,7 +1179,8 @@ public abstract class Tool
 		  return this.getNextStates0(action, acts, s0, s1, nss, cm);
 	  }
 	}
-	return s1;
+	// Basis: a user-defined guard evaluated false; its bindings are not at hand here.
+	return this.processUnsatisfied(s0, action, s1, pred, Context.Empty, nss, cm);
   }
 
   private final TLCState getNextStatesApplSwitch(final Action action, final OpApplNode pred, final ActionItemList acts, final Context c, final TLCState s0,
@@ -1545,6 +1546,10 @@ public abstract class Tool
 	    }
 	    if (((BoolValue)bval).val) {
 	      resState = this.getNextStates(action, acts, s0, s1, nss, cm);
+	    } else {
+	      // Basis: a guard conjunct evaluated false on the general path too,
+	      // not only when every primed variable was already assigned.
+	      return this.processUnsatisfied(s0, action, s1, pred, c, nss, cm);
 	    }
 	    return resState;
 	  }

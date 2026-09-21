@@ -51,7 +51,14 @@ import tlc2.tool.fp.FPSetFactory;
 import tlc2.util.FP64;
 import tlc2.tool.impl.FastTool;
 import tlc2.tool.impl.Tool;
-import tlc2.util.NoopStateWriter;
+import tlc2.tool.EvalControl;
+import tlc2.tool.StateVec;
+import tlc2.tool.coverage.CostModel;
+import tlc2.util.Context;
+import tla2sany.semantic.OpDefNode;
+import tlc2.debug.TLCDebuggerExpression;
+import tlc2.value.IValue;
+import tlc2.value.impl.BoolValue;
 import util.FileUtil;
 import util.SimpleFilenameToStream;
 import util.ToolIO;
@@ -90,6 +97,7 @@ public final class Resident {
 
 	private final Recorder recorder = new Recorder();
 	private Tool tool;
+	private GraphStore store;
 	private ModelChecker checker;
 	private Thread checkerThread;
 	private String metadir;
@@ -165,6 +173,21 @@ public final class Resident {
 			reply.add("stats", stats());
 			return reply;
 		}
+		case "trace":
+			return trace(request);
+		case "neighbours":
+			return neighbours(request);
+		case "eval":
+			return eval(request);
+		case "screen":
+			return screen(request);
+		case "guard_profile":
+			return guardProfile();
+		case "store": {
+			final JsonObject reply = ok();
+			reply.add("store", storeInfo());
+			return reply;
+		}
 		case "close":
 			return ok();
 		default:
@@ -223,7 +246,8 @@ public final class Resident {
 			tool = new FastTool(mainFile, config, new SimpleFilenameToStream(specDir), Tool.Mode.MC,
 					new HashMap<>());
 			final boolean checkDeadlock = deadlock && tool.getModelConfig().getCheckDeadlock();
-			checker = new ModelChecker(tool, metadir, new NoopStateWriter(), checkDeadlock, null,
+			store = new GraphStore(metadir);
+			checker = new ModelChecker(tool, metadir, store, checkDeadlock, null,
 					FPSetFactory.getFPSetInitialized(new FPSetConfiguration(), metadir, specFile.getName()),
 					openedAt);
 			TLCGlobals.mainChecker = checker;
@@ -479,7 +503,329 @@ public final class Resident {
 		s.addProperty("since_open_ms", System.currentTimeMillis() - openedAt);
 		s.addProperty("running", checkerThread != null && checkerThread.isAlive());
 		s.addProperty("finished", resultCode != null);
+		s.add("store", storeInfo());
 		return s;
+	}
+
+	private JsonObject storeInfo() {
+		final JsonObject o = new JsonObject();
+		if (store == null) {
+			return o;
+		}
+		o.addProperty("states", store.states());
+		o.addProperty("initial", store.initialStates());
+		o.addProperty("edges", store.edges());
+		o.addProperty("unsatisfied", store.unsatisfied());
+		o.addProperty("bytes", store.bytes());
+		return o;
+	}
+
+	// ─── the store's queries ────────────────────────────────────────────
+
+	private JsonObject notOpen() {
+		return error(null, "not_open", "open a spec first");
+	}
+
+	private static Long fpOf(final JsonObject request, final String key) {
+		if (!request.has(key) || request.get(key).isJsonNull()) {
+			return null;
+		}
+		final JsonElement e = request.get(key);
+		try {
+			return e.getAsJsonPrimitive().isNumber() ? e.getAsLong() : Long.parseLong(e.getAsString());
+		} catch (final RuntimeException ex) {
+			return null;
+		}
+	}
+
+	private String actionName(final long id) {
+		final Action a = store.action((int) id);
+		return a == null ? (id < 0 ? "<Initial predicate>" : "action#" + id) : a.getNameOfDefault();
+	}
+
+	/** The path from an initial state to a stored fingerprint. */
+	private JsonObject trace(final JsonObject request) {
+		if (store == null) {
+			return notOpen();
+		}
+		final Long fp = fpOf(request, "fp");
+		if (fp == null) {
+			return error(null, "invalid_request", "trace needs `fp`, a stored fingerprint");
+		}
+		final long[][] path = store.pathTo(fp);
+		if (path == null) {
+			return error(null, "unknown_state", "no stored state with fingerprint " + fp);
+		}
+		final JsonArray states = new JsonArray();
+		for (int i = 0; i < path.length; i++) {
+			final TLCState state = store.read(path[i][0]);
+			final JsonObject s = state == null ? new JsonObject() : Recorder.state(state);
+			s.addProperty("ordinal", i + 1);
+			s.addProperty("fp", path[i][0]);
+			s.addProperty("action", actionName(path[i][1]));
+			states.add(s);
+		}
+		final JsonObject reply = ok();
+		reply.addProperty("fp", fp);
+		reply.addProperty("length", path.length);
+		reply.addProperty("shortest", TLCGlobals.getNumWorkers() == 1);
+		reply.add("states", states);
+		return reply;
+	}
+
+	/** Recorded predecessors of a stored state and, freshly computed, its successors per action. */
+	private JsonObject neighbours(final JsonObject request) {
+		if (store == null) {
+			return notOpen();
+		}
+		final Long fp = fpOf(request, "fp");
+		if (fp == null) {
+			return error(null, "invalid_request", "neighbours needs `fp`, a stored fingerprint");
+		}
+		final TLCState state = store.read(fp);
+		if (state == null) {
+			return error(null, "unknown_state", "no stored state with fingerprint " + fp);
+		}
+		final JsonObject reply = ok();
+		reply.addProperty("fp", fp);
+		reply.addProperty("level", store.level(fp));
+		reply.add("state", Recorder.state(state));
+		final JsonArray preds = new JsonArray();
+		for (final long[] p : store.predecessorsOf(fp)) {
+			final JsonObject o = new JsonObject();
+			o.addProperty("fp", p[0]);
+			o.addProperty("action", actionName(p[1]));
+			o.addProperty("action_id", p[1]);
+			o.addProperty("seen_before", (p[2] & tlc2.util.IStateWriter.IsSeen) != 0);
+			preds.add(o);
+		}
+		reply.add("predecessors", preds);
+		final JsonArray succs = new JsonArray();
+		int enabled = 0;
+		for (final Action a : tool.getActions()) {
+			final JsonObject o = new JsonObject();
+			o.addProperty("action", a.getNameOfDefault());
+			o.addProperty("action_id", a.getId());
+			try {
+				final StateVec next = tool.getNextStates(a, state);
+				o.addProperty("enabled", next.size() > 0);
+				o.addProperty("successors", next.size());
+				if (next.size() > 0) {
+					enabled++;
+				}
+				final JsonArray fps = new JsonArray();
+				for (int i = 0; i < next.size(); i++) {
+					final TLCState succ = next.elementAt(i);
+					final JsonObject so = new JsonObject();
+					long sfp = 0;
+					try {
+						sfp = succ.fingerPrint();
+					} catch (final RuntimeException e) {
+						so.addProperty("unassigned", true);
+					}
+					so.addProperty("fp", sfp);
+					so.addProperty("stored", store.contains(sfp));
+					so.add("changed", changed(state, succ));
+					fps.add(so);
+				}
+				o.add("states", fps);
+			} catch (final Throwable t) {
+				o.addProperty("enabled", (Boolean) null);
+				o.addProperty("error", t.toString());
+			}
+			succs.add(o);
+		}
+		reply.addProperty("enabled_actions", enabled);
+		reply.add("successors", succs);
+		return reply;
+	}
+
+	/** The variables whose values differ between two states. */
+	private static JsonArray changed(final TLCState a, final TLCState b) {
+		final JsonArray out = new JsonArray();
+		final Map<util.UniqueString, IValue> va = a.getVals();
+		final Map<util.UniqueString, IValue> vb = b.getVals();
+		if (va == null || vb == null) {
+			return out;
+		}
+		for (final Map.Entry<util.UniqueString, IValue> e : vb.entrySet()) {
+			final IValue before = va.get(e.getKey());
+			if (before == null || !before.equals(e.getValue())) {
+				out.add(e.getKey().toString());
+			}
+		}
+		return out;
+	}
+
+	/** Parse a caller expression against the root module, as the debugger does. */
+	private OpDefNode parse(final String expression) throws Exception {
+		final tlc2.tool.impl.SpecProcessor proc = tool.getSpecProcessor();
+		final OpDefNode def = TLCDebuggerExpression.process(proc, proc.getRootModule(), expression);
+		if (def == null) {
+			throw new IllegalArgumentException("could not parse expression: " + expression);
+		}
+		return def;
+	}
+
+	/** Evaluate an expression in a stored state, or over a stored state pair. */
+	private JsonObject eval(final JsonObject request) {
+		if (store == null) {
+			return notOpen();
+		}
+		final String expression = string(request, "expr", null);
+		final Long fp = fpOf(request, "fp");
+		if (expression == null || fp == null) {
+			return error(null, "invalid_request", "eval needs `expr` and `fp` (and optionally `fp2` for a primed expression)");
+		}
+		final TLCState s0 = store.read(fp);
+		if (s0 == null) {
+			return error(null, "unknown_state", "no stored state with fingerprint " + fp);
+		}
+		final Long fp2 = fpOf(request, "fp2");
+		TLCState s1 = null;
+		if (fp2 != null) {
+			s1 = store.read(fp2);
+			if (s1 == null) {
+				return error(null, "unknown_state", "no stored state with fingerprint " + fp2);
+			}
+		}
+		final JsonObject reply = ok();
+		reply.addProperty("expr", expression);
+		reply.addProperty("fp", fp);
+		final long started = System.currentTimeMillis();
+		try {
+			final OpDefNode def = parse(expression);
+			final IValue value = s1 == null ? tool.eval(def.getBody(), Context.Empty, s0)
+					: tool.eval(def.getBody(), Context.Empty, s0, s1, EvalControl.Clear, CostModel.DO_NOT_RECORD);
+			reply.addProperty("evaluated", true);
+			reply.add("value", Recorder.value(value));
+			reply.addProperty("tla", value.toString());
+		} catch (final Throwable t) {
+			reply.addProperty("evaluated", false);
+			reply.addProperty("error", t.getMessage() == null ? t.toString() : t.getMessage());
+		}
+		reply.addProperty("duration_ms", System.currentTimeMillis() - started);
+		reply.add("messages", recorder.drainMessages());
+		return reply;
+	}
+
+	/** Evaluate candidate state predicates over every stored state. */
+	private JsonObject screen(final JsonObject request) throws InterruptedException {
+		if (store == null) {
+			return notOpen();
+		}
+		if (!request.has("candidates") || !request.get("candidates").isJsonArray()) {
+			return error(null, "invalid_request", "screen needs `candidates`, a list of state predicates");
+		}
+		final long budgetMs = request.has("budget_ms") ? request.get("budget_ms").getAsLong() : 60_000L;
+		final JsonArray candidates = request.getAsJsonArray("candidates");
+		final int n = candidates.size();
+		final String[] texts = new String[n];
+		final OpDefNode[] defs = new OpDefNode[n];
+		final String[] errors = new String[n];
+		final long[] violations = new long[n];
+		final Long[] firstViolation = new Long[n];
+		final long[] evaluated = new long[n];
+		for (int i = 0; i < n; i++) {
+			texts[i] = candidates.get(i).getAsString();
+			try {
+				defs[i] = parse(texts[i]);
+			} catch (final Throwable t) {
+				errors[i] = t.getMessage() == null ? t.toString() : t.getMessage();
+			}
+		}
+		if (checkerThread != null && checkerThread.isAlive()) {
+			checker.suspend();
+		}
+		final long started = System.currentTimeMillis();
+		final long[] fps = store.fingerprints();
+		int scanned = 0;
+		boolean budgetHit = false;
+		for (final long fp : fps) {
+			if (System.currentTimeMillis() - started > budgetMs) {
+				budgetHit = true;
+				break;
+			}
+			final TLCState state = store.read(fp);
+			if (state == null) {
+				continue;
+			}
+			scanned++;
+			for (int i = 0; i < n; i++) {
+				if (defs[i] == null || errors[i] != null) {
+					continue;
+				}
+				try {
+					final IValue v = tool.eval(defs[i].getBody(), Context.Empty, state);
+					evaluated[i]++;
+					if (!(v instanceof BoolValue)) {
+						errors[i] = "not a boolean at fingerprint " + fp + ": " + v;
+					} else if (!((BoolValue) v).val) {
+						violations[i]++;
+						if (firstViolation[i] == null) {
+							firstViolation[i] = fp;
+						}
+					}
+				} catch (final Throwable t) {
+					errors[i] = (t.getMessage() == null ? t.toString() : t.getMessage()) + " at fingerprint " + fp;
+				}
+			}
+		}
+		final JsonObject reply = ok();
+		reply.addProperty("stored", fps.length);
+		reply.addProperty("scanned", scanned);
+		reply.addProperty("budget_exhausted", budgetHit);
+		reply.addProperty("duration_ms", System.currentTimeMillis() - started);
+		final JsonArray results = new JsonArray();
+		for (int i = 0; i < n; i++) {
+			final JsonObject r = new JsonObject();
+			r.addProperty("expr", texts[i]);
+			if (errors[i] != null) {
+				r.addProperty("verdict", "not_evaluable");
+				r.addProperty("error", errors[i]);
+			} else if (violations[i] > 0) {
+				r.addProperty("verdict", "violated");
+				r.addProperty("violations", violations[i]);
+				r.addProperty("first_violation_fp", firstViolation[i]);
+				r.addProperty("first_violation_level", store.level(firstViolation[i]));
+			} else {
+				r.addProperty("verdict", budgetHit ? "no_violation_in_scanned" : "holds_on_stored");
+			}
+			r.addProperty("evaluated", evaluated[i]);
+			results.add(r);
+		}
+		reply.add("results", results);
+		reply.add("messages", recorder.drainMessages());
+		return reply;
+	}
+
+	/** The guard conjuncts that kept transitions from firing, most often first. */
+	private JsonObject guardProfile() {
+		if (store == null) {
+			return notOpen();
+		}
+		final JsonObject reply = ok();
+		final JsonArray rows = new JsonArray();
+		for (final GraphStore.Blocked b : store.blocked()) {
+			final JsonObject o = new JsonObject();
+			o.addProperty("action", b.action);
+			o.addProperty("action_id", b.actionId);
+			o.addProperty("location", b.location);
+			o.addProperty("text", b.text);
+			o.addProperty("count", b.count);
+			o.addProperty("example_fp", b.exampleFp);
+			if (b.exampleBindings != null) {
+				final JsonObject bindings = new JsonObject();
+				b.exampleBindings.forEach(bindings::addProperty);
+				o.add("example_bindings", bindings);
+			}
+			rows.add(o);
+		}
+		reply.addProperty("unsatisfied", store.unsatisfied());
+		reply.add("blocked", rows);
+		reply.addProperty("note",
+				"attribution is to the first guard conjunct that evaluated false in TLC's evaluation order, on the all-assigned path only");
+		return reply;
 	}
 
 	private void shutdown() {

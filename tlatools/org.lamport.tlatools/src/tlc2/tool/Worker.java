@@ -494,7 +494,7 @@ public final class Worker extends IdThread implements IWorker, INextStateFunctor
 	public TLCState addUnsatisfiedState(final TLCState curState, final Action action, final TLCState succState,
 			final SemanticNode pred, final Context c) {
 		if (this.allStateWriter.isConstrained()) {
-			this.allStateWriter.writeState(curState, succState, IStateWriter.IsNotInModel, action, pred);
+			this.allStateWriter.writeUnsatisfied(curState, action, succState, pred, c);
 		}
 		return succState;
 	}	

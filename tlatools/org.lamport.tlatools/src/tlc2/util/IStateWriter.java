@@ -65,6 +65,17 @@ public interface IStateWriter {
 
 	void writeState(TLCState state, TLCState successor, short stateFlags, Action action, SemanticNode pred);
 
+	/**
+	 * A guard conjunct {@code pred} of {@code action} evaluated false at
+	 * {@code state} under the bindings in {@code c}, so the transition to
+	 * {@code successor} was not taken. Delivered only to a constrained writer.
+	 * The default keeps the older signature's behaviour and drops the context.
+	 */
+	default void writeUnsatisfied(TLCState state, Action action, TLCState successor, SemanticNode pred,
+			tlc2.util.Context c) {
+		writeState(state, successor, IsNotInModel, action, pred);
+	}
+
 	void writeState(TLCState state, TLCState successor, short stateFlags, Visualization visualization);
 	
 	void writeState(TLCState state, TLCState successor, BitVector actionChecks, int from, int length, short stateFlags);
