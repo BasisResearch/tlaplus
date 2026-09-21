@@ -559,7 +559,9 @@ public final class Worker extends IdThread implements IWorker, INextStateFunctor
                         {
 							MP.printError(EC.TLC_INVARIANT_VIOLATED_BEHAVIOR,
 									this.tool.getInvNames()[k]);
-							this.tlc.trace.printTrace(curState, succState);
+							if (TLCGlobals.continuationTraceAllowed(this.tool.getInvNames()[k])) {
+								this.tlc.trace.printTrace(curState, succState);
+							}
 							return false;
                         }
                 	} else {
@@ -591,7 +593,9 @@ public final class Worker extends IdThread implements IWorker, INextStateFunctor
                         {
                             MP.printError(EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR, this.tool
                                     .getImpliedActNames()[k]);
-                            this.tlc.trace.printTrace(curState, succState);
+                            if (TLCGlobals.continuationTraceAllowed(this.tool.getImpliedActNames()[k])) {
+                                this.tlc.trace.printTrace(curState, succState);
+                            }
 							return false;
                        }
                     } else {

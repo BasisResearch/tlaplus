@@ -507,6 +507,14 @@ public final class Resident {
 			// invariant's verdict. Process-global, as TLC's -continue is.
 			TLCGlobals.continuation = request.get("continue").getAsBoolean();
 		}
+		// Traces per violated property under continuation (default 1: the
+		// first counterexample of each; later violations are counted only).
+		// Regenerating a trace re-runs the next-state relation from an initial
+		// state, which dominates a run whose invariant fails on most states.
+		TLCGlobals.continuationTraceLimit = request.has("traces_per_property")
+				? request.get("traces_per_property").getAsInt()
+				: 1;
+		TLCGlobals.resetContinuationTraces();
 
 		if (resultCode == null && checkerFailure == null) {
 			if (checkerThread == null) {
@@ -564,9 +572,14 @@ public final class Resident {
 		if (trace != null) {
 			reply.add("trace", traceJson(trace));
 		}
+		// Under the per-property trace cap a violation past the cap is
+		// reported (and counted in the verdicts) but carries no states;
+		// those entries are not listed as traces.
 		final JsonArray all = new JsonArray();
 		for (final Recorder.Trace t : recorder.traces()) {
-			all.add(traceJson(t));
+			if (!t.states.isEmpty()) {
+				all.add(traceJson(t));
+			}
 		}
 		reply.add("traces", all);
 		reply.add("invariants", invariantVerdicts(finished));

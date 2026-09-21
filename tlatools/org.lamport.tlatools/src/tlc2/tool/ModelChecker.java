@@ -509,7 +509,9 @@ public class ModelChecker extends AbstractChecker
                         {
 							MP.printError(EC.TLC_INVARIANT_VIOLATED_BEHAVIOR,
 									tool.getInvNames()[k]);
-							this.trace.printTrace(curState, succState);
+							if (TLCGlobals.continuationTraceAllowed(tool.getInvNames()[k])) {
+								this.trace.printTrace(curState, succState);
+							}
 							return false;
                         }
                 	} else {
