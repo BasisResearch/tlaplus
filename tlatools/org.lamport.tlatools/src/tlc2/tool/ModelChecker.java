@@ -1088,6 +1088,11 @@ public class ModelChecker extends AbstractChecker
 	/* (non-Javadoc)
 	 * @see tlc2.tool.AbstractChecker#getStateQueueSize()
 	 */
+	/** The workers of the current run, for their statistics; empty before it. */
+	public IWorker[] getWorkers() {
+		return this.workers == null ? new IWorker[0] : this.workers;
+	}
+
 	@Override
 	public long getStateQueueSize() {
 		return theStateQueue.size();

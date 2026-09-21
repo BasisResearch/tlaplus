@@ -183,6 +183,23 @@ public final class Resident {
 			return screen(request);
 		case "guard_profile":
 			return guardProfile();
+		case "coverage": {
+			if (tool == null) {
+				return notOpen();
+			}
+			final JsonObject reply = ok();
+			reply.add("coverage", tlc2.tool.coverage.CoverageWalk.walk(tool));
+			return reply;
+		}
+		case "registers": {
+			if (checker == null) {
+				return notOpen();
+			}
+			final JsonObject reply = ok();
+			reply.add("stats", stats());
+			reply.add("registers", registers());
+			return reply;
+		}
 		case "store": {
 			final JsonObject reply = ok();
 			reply.add("store", storeInfo());
@@ -505,6 +522,94 @@ public final class Resident {
 		s.addProperty("finished", resultCode != null);
 		s.add("store", storeInfo());
 		return s;
+	}
+
+	/**
+	 * The counters TLC keeps beyond the headline statistics: whether the
+	 * reachable graph was exhausted and what stopped the run, the workers'
+	 * out-degree distribution (bucketed, the top bucket saturating at 32),
+	 * the fingerprint set's own statistics, the fingerprint-collision
+	 * probability, and the liveness checkers in play.
+	 */
+	private JsonObject registers() {
+		final JsonObject r = new JsonObject();
+		final boolean finished = resultCode != null;
+		final boolean queueEmpty = checker.getStateQueueSize() == 0;
+		r.addProperty("finished", finished);
+		r.addProperty("exhausted", finished && queueEmpty && checkerFailure == null
+				&& (resultCode == EC.NO_ERROR || TLCGlobals.continuation));
+		r.addProperty("stopped_by", checkerFailure != null ? "error"
+				: !finished ? (checkerThread == null ? "not_started" : "budget")
+				: resultCode == EC.NO_ERROR ? "exhausted"
+				: TLCGlobals.continuation ? "exhausted_with_violations" : "violation");
+		if (finished) {
+			r.addProperty("result_code", resultCode);
+		}
+		r.addProperty("workers", TLCGlobals.getNumWorkers());
+		r.addProperty("continuation", TLCGlobals.continuation);
+		r.addProperty("coverage", tlc2.tool.coverage.CoverageWalk.enabled());
+		// Out-degree across workers.
+		final JsonObject outDegree = new JsonObject();
+		long observations = 0;
+		int min = Integer.MAX_VALUE;
+		int max = -1;
+		double weightedMean = 0;
+		final java.util.TreeMap<Integer, Long> samples = new java.util.TreeMap<>();
+		for (final tlc2.tool.IWorker w : checker.getWorkers()) {
+			if (!(w instanceof tlc2.tool.Worker)) {
+				continue;
+			}
+			final tlc2.util.statistics.IBucketStatistics b = ((tlc2.tool.Worker) w).getOutDegree();
+			if (b == null || b.getObservations() == 0) {
+				continue;
+			}
+			observations += b.getObservations();
+			min = Math.min(min, b.getMin());
+			max = Math.max(max, b.getMax());
+			weightedMean += b.getMean() * b.getObservations();
+			b.getSamples().forEach((k, v) -> samples.merge(k, v, Long::sum));
+		}
+		if (observations > 0) {
+			outDegree.addProperty("observations", observations);
+			outDegree.addProperty("min", min);
+			outDegree.addProperty("max", max);
+			outDegree.addProperty("mean", weightedMean / observations);
+			outDegree.addProperty("saturated_at", 32);
+			final JsonObject buckets = new JsonObject();
+			samples.forEach((k, v) -> buckets.addProperty(String.valueOf(k), v));
+			outDegree.add("buckets", buckets);
+		}
+		r.add("out_degree", outDegree);
+		// The fingerprint set.
+		final JsonObject fpset = new JsonObject();
+		fpset.addProperty("implementation", checker.theFPSet.getClass().getSimpleName());
+		if (checker.theFPSet instanceof tlc2.tool.fp.FPSetStatistic) {
+			final tlc2.tool.fp.FPSetStatistic f = (tlc2.tool.fp.FPSetStatistic) checker.theFPSet;
+			try {
+				fpset.addProperty("table_count", f.getTblCnt());
+				fpset.addProperty("disk_lookups", f.getDiskLookupCnt());
+				fpset.addProperty("memory_hits", f.getMemHitCnt());
+				fpset.addProperty("disk_hits", f.getDiskHitCnt());
+				fpset.addProperty("disk_writes", f.getDiskWriteCnt());
+				fpset.addProperty("flush_time_ms", f.getFlushTime());
+				fpset.addProperty("bytes", f.sizeof());
+			} catch (final RuntimeException e) {
+				fpset.addProperty("error", e.toString());
+			}
+		}
+		r.add("fpset", fpset);
+		final long generated = checker.getStatesGenerated();
+		final long distinct = checker.getDistinctStatesGenerated();
+		if (distinct > 0 && generated > 0) {
+			r.addProperty("fp_collision_probability",
+					tlc2.tool.AbstractChecker.calculateOptimisticProbability(distinct, generated));
+		}
+		// Liveness.
+		final JsonObject liveness = new JsonObject();
+		liveness.addProperty("enabled", TLCGlobals.doLiveness());
+		liveness.addProperty("temporal_properties", tool.getTemporals().length);
+		r.add("liveness", liveness);
+		return r;
 	}
 
 	private JsonObject storeInfo() {
