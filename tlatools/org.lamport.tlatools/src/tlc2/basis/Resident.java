@@ -106,6 +106,12 @@ public final class Resident {
 	private String configName;
 	private int workers;
 	private boolean checkDeadlock;
+	/** Set when opened in simulate mode: random behaviours instead of a graph. */
+	private tlc2.tool.Simulator simulator;
+	private Thread simulatorThread;
+	private volatile Integer simulatorResult;
+	private volatile Throwable simulatorFailure;
+	private long simulationMs;
 	private Thread checkerThread;
 	private String metadir;
 	private volatile Integer resultCode;
@@ -192,6 +198,8 @@ public final class Resident {
 			return guardProfile();
 		case "refresh":
 			return refresh(request);
+		case "simulate":
+			return simulate(request);
 		case "coverage": {
 			if (tool == null) {
 				return notOpen();
@@ -259,6 +267,10 @@ public final class Resident {
 					+ FileUtil.separator;
 		}
 
+		final String mode = string(request, "mode", "check");
+		if (mode.equals("simulate")) {
+			return openSimulate(request, specFile, specDir, mainFile, config, workers, deadlock);
+		}
 		openedAt = System.currentTimeMillis();
 		recorder.drainMessages();
 		this.specDir = specDir;
@@ -299,6 +311,131 @@ public final class Resident {
 		reply.addProperty("coverage", coverage);
 		reply.addProperty("fp_index", fpIndex);
 		reply.add("catalogue", catalogue());
+		reply.add("messages", recorder.drainMessages());
+		return reply;
+	}
+
+	/**
+	 * Open for random simulation: a Tool in simulation mode and a
+	 * {@link tlc2.tool.Simulator} with {@code depth} (default 100 steps per
+	 * behaviour), {@code traces} (default unbounded: run until stopped or a
+	 * violation) and {@code seed} (default random, reported).
+	 */
+	private JsonObject openSimulate(final JsonObject request, final File specFile, final String specDir,
+			final String mainFile, final String config, final int workers, final boolean deadlock) {
+		openedAt = System.currentTimeMillis();
+		recorder.drainMessages();
+		this.specDir = specDir;
+		this.mainFile = mainFile;
+		this.configName = config;
+		this.workers = workers;
+		final int depth = request.has("depth") ? request.get("depth").getAsInt() : 100;
+		final long traces = request.has("traces") ? request.get("traces").getAsLong() : Long.MAX_VALUE;
+		final tlc2.util.RandomGenerator rng = new tlc2.util.RandomGenerator();
+		final long seed = request.has("seed") ? request.get("seed").getAsLong() : rng.nextLong();
+		rng.setSeed(seed);
+		try {
+			TLCGlobals.setNumWorkers(workers);
+			TLCGlobals.coverageInterval = -1;
+			FP64.Init(0);
+			tlc2.value.RandomEnumerableValues.setSeed(seed);
+			metadir = FileUtil.makeMetaDir(new Date(openedAt), specDir, null);
+			tool = new FastTool(mainFile, config, new SimpleFilenameToStream(specDir), Tool.Mode.Simulation,
+					new HashMap<>());
+			// A non-null traceActions sizes the per-worker action-pair counters;
+			// anything but BASIC/FULL keeps TLC from writing its dot files.
+			simulator = new tlc2.tool.Simulator(tool, metadir, null, deadlock, depth, traces, "STATS", rng, seed,
+					new SimpleFilenameToStream(specDir), workers);
+			TLCGlobals.simulator = simulator;
+		} catch (final Throwable t) {
+			tool = null;
+			simulator = null;
+			final JsonObject reply = error(null, "open_failed", t.toString());
+			reply.add("messages", recorder.drainMessages());
+			return reply;
+		}
+		final JsonObject reply = ok();
+		reply.addProperty("mode", "simulate");
+		reply.addProperty("spec", specFile.getPath());
+		reply.addProperty("root_module", tool.getRootName());
+		reply.addProperty("metadir", metadir);
+		reply.addProperty("workers", workers);
+		reply.addProperty("depth", depth);
+		reply.addProperty("traces", traces == Long.MAX_VALUE ? null : traces);
+		reply.addProperty("seed", seed);
+		reply.addProperty("extended_statistics", tlc2.tool.Simulator.EXTENDED_STATISTICS);
+		reply.add("catalogue", catalogue());
+		reply.add("messages", recorder.drainMessages());
+		return reply;
+	}
+
+	/**
+	 * Run random behaviours until {@code traces} of them, a violation, or
+	 * {@code budget_ms}; then report what the recorder saw, the simulator's
+	 * statistics and the action-pair follow matrix. A run that found nothing
+	 * proves nothing: the verdict says so.
+	 */
+	private JsonObject simulate(final JsonObject request) throws InterruptedException {
+		if (simulator == null) {
+			return error(null, "not_simulating", "open with mode simulate first");
+		}
+		final long budgetMs = request.has("budget_ms") ? request.get("budget_ms").getAsLong() : 60_000L;
+		final long started = System.currentTimeMillis();
+		if (simulatorThread == null) {
+			simulatorThread = new Thread(() -> {
+				try {
+					simulatorResult = simulator.simulate();
+				} catch (final Throwable t) {
+					simulatorFailure = t;
+				}
+			}, "tlc-resident-simulator");
+			simulatorThread.setDaemon(true);
+			simulatorThread.start();
+		}
+		boolean stopped = false;
+		while (simulatorThread.isAlive()) {
+			if (System.currentTimeMillis() - started >= budgetMs) {
+				simulator.stop();
+				stopped = true;
+				simulatorThread.join(10_000);
+				break;
+			}
+			simulatorThread.join(20);
+		}
+		simulationMs += System.currentTimeMillis() - started;
+		final JsonObject reply = ok();
+		final boolean finished = !simulatorThread.isAlive();
+		reply.addProperty("finished", finished);
+		reply.addProperty("stopped_by_budget", stopped);
+		final int outcome = recorder.outcome();
+		if (simulatorFailure != null) {
+			reply.addProperty("verdict", "error");
+			reply.addProperty("error", simulatorFailure.toString());
+		} else if (outcome != EC.NO_ERROR) {
+			reply.addProperty("verdict", verdict(EC.GENERAL, outcome));
+		} else {
+			reply.addProperty("verdict", "no_violation_found");
+		}
+		final String property = recorder.outcomeProperty();
+		if (property != null) {
+			reply.addProperty("violated", property);
+		}
+		final JsonArray all = new JsonArray();
+		for (final Recorder.Trace t : recorder.traces()) {
+			all.add(traceJson(t));
+		}
+		reply.add("traces", all);
+		try {
+			reply.add("statistics", Recorder.value(simulator.getStatistics(null)));
+		} catch (final Throwable t) {
+			reply.addProperty("statistics_error", t.toString());
+		}
+		try {
+			reply.add("action_flow", simulator.actionFlowAsJson());
+		} catch (final Throwable t) {
+			reply.addProperty("action_flow_error", t.toString());
+		}
+		reply.addProperty("simulation_ms", simulationMs);
 		reply.add("messages", recorder.drainMessages());
 		return reply;
 	}
@@ -1081,6 +1218,14 @@ public final class Resident {
 	}
 
 	private void shutdown() {
+		if (simulator != null && simulatorThread != null && simulatorThread.isAlive()) {
+			simulator.stop();
+			try {
+				simulatorThread.join(5000);
+			} catch (final InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		}
 		if (checker != null && checkerThread != null && checkerThread.isAlive()) {
 			checker.stop();
 			try {
