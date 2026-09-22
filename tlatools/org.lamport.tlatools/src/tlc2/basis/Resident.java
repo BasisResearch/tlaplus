@@ -101,6 +101,15 @@ public final class Resident {
 	private ModelChecker checker;
 	/** True after an incremental refresh: the store is current, the checker is not. */
 	private boolean refreshed;
+	/** After an incremental refresh: whether the replay explored the whole graph. */
+	private boolean refreshComplete;
+	/**
+	 * Set when a refresh that did not replace the tool left TLC's static
+	 * tables unfit for the parked checker to resume: why a restart is needed.
+	 */
+	private String restartRequired;
+	/** The model config's text when the store was built, to detect edits. */
+	private String configText;
 	private String specDir;
 	private String mainFile;
 	private String configName;
@@ -111,6 +120,8 @@ public final class Resident {
 	private Thread simulatorThread;
 	private volatile Integer simulatorResult;
 	private volatile Throwable simulatorFailure;
+	/** A budget stop ends the simulator for good; later calls report it. */
+	private boolean simulationStoppedByBudget;
 	private long simulationMs;
 	private Thread checkerThread;
 	private String metadir;
@@ -289,6 +300,7 @@ public final class Resident {
 					new HashMap<>());
 			final boolean checkDeadlock = deadlock && tool.getModelConfig().getCheckDeadlock();
 			this.checkDeadlock = checkDeadlock;
+			configText = readConfig();
 			store = new GraphStore(metadir);
 			checker = new ModelChecker(tool, metadir, store, checkDeadlock, null,
 					FPSetFactory.getFPSetInitialized(new FPSetConfiguration(), metadir, specFile.getName()),
@@ -381,6 +393,13 @@ public final class Resident {
 		}
 		final long budgetMs = request.has("budget_ms") ? request.get("budget_ms").getAsLong() : 60_000L;
 		final long started = System.currentTimeMillis();
+		if (simulationStoppedByBudget) {
+			// Simulator.stop() is final: there is nothing to resume, so the
+			// stopped run is reported again rather than as a completed one.
+			final JsonObject reply = simulationReply(true);
+			reply.addProperty("resumable", false);
+			return reply;
+		}
 		if (simulatorThread == null) {
 			simulatorThread = new Thread(() -> {
 				try {
@@ -397,12 +416,17 @@ public final class Resident {
 			if (System.currentTimeMillis() - started >= budgetMs) {
 				simulator.stop();
 				stopped = true;
+				simulationStoppedByBudget = true;
 				simulatorThread.join(10_000);
 				break;
 			}
 			simulatorThread.join(20);
 		}
 		simulationMs += System.currentTimeMillis() - started;
+		return simulationReply(stopped);
+	}
+
+	private JsonObject simulationReply(final boolean stopped) {
 		final JsonObject reply = ok();
 		final boolean finished = !simulatorThread.isAlive();
 		reply.addProperty("finished", finished);
@@ -496,6 +520,10 @@ public final class Resident {
 		if (refreshed) {
 			return error(null, "refreshed",
 					"this session was refreshed incrementally: its store is current and the store queries serve it, but TLC's own checker is not; open a new session for a full run");
+		}
+		if (restartRequired != null && resultCode == null && checkerFailure == null) {
+			return error(null, "restart_required",
+					"the paused run cannot resume in this process: " + restartRequired + "; open a new session");
 		}
 		final long budgetMs = request.has("budget_ms") ? request.get("budget_ms").getAsLong() : Long.MAX_VALUE;
 		final long budgetStates = request.has("budget_states") ? request.get("budget_states").getAsLong()
@@ -618,8 +646,7 @@ public final class Resident {
 		final JsonArray out = new JsonArray();
 		final Map<String, Integer> counts = recorder.violationCounts();
 		final List<Recorder.Trace> traces = recorder.traces();
-		final boolean exhausted = finished && checkerFailure == null && resultCode != null
-				&& (resultCode == EC.NO_ERROR || TLCGlobals.continuation);
+		final boolean exhausted = finished && explorationComplete();
 		for (final String name : tool.getInvNames()) {
 			final JsonObject v = new JsonObject();
 			v.addProperty("name", name);
@@ -660,6 +687,33 @@ public final class Resident {
 			return "evaluation_failed";
 		default:
 			return code == EC.NO_ERROR ? "ok" : "error";
+		}
+	}
+
+	/**
+	 * Whether the checker explored the whole reachable graph: it ended on its
+	 * own with nothing left in its queue, and on a code that never cuts a
+	 * state's expansion short. A deadlock is found after the state's (empty)
+	 * expansion and a temporal violation after the graph is complete; an
+	 * invariant or action-property violation aborts the expansion it occurs
+	 * in unless TLC continues past violations. Any other error may have.
+	 */
+	private boolean explorationComplete() {
+		if (checkerThread == null || checkerThread.isAlive() || checkerFailure != null || resultCode == null
+				|| checker.getStateQueueSize() != 0) {
+			return false;
+		}
+		switch (resultCode) {
+		case EC.NO_ERROR:
+		case EC.TLC_DEADLOCK_REACHED:
+		case EC.TLC_TEMPORAL_PROPERTY_VIOLATED:
+			return true;
+		case EC.TLC_INVARIANT_VIOLATED_INITIAL:
+		case EC.TLC_INVARIANT_VIOLATED_BEHAVIOR:
+		case EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR:
+			return TLCGlobals.continuation;
+		default:
+			return false;
 		}
 	}
 
@@ -818,21 +872,40 @@ public final class Resident {
 
 	/**
 	 * Re-parse the spec after an edit and re-explore only what the edit
-	 * reaches (see {@link Incremental}); a change to the variables, the
-	 * initial predicate or the config discards the store and starts over.
+	 * reaches (see {@link Incremental}). A change to the variables, the
+	 * initial predicate, a constraint, the view, the symmetry set or the
+	 * config, or an old exploration that did not finish, leaves nothing to
+	 * carry: the reply asks for a restart and a full run.
+	 *
+	 * <p>
+	 * A paused checker is left parked, not stopped: stopping ends its run as
+	 * if it had finished. Parsing the edited spec rebinds TLC's static
+	 * variable tables, so when the new tool is not adopted they are rebound
+	 * to the old one, and the parked run may resume only if that is exact.
 	 */
 	private JsonObject refresh(final JsonObject request) throws Exception {
+		if (simulator != null) {
+			return error(null, "not_checking",
+					"refresh replays a model-checking store; a simulate session has none. Open a new session");
+		}
 		if (tool == null) {
 			return notOpen();
 		}
 		final long budgetMs = request.has("budget_ms") ? request.get("budget_ms").getAsLong() : 60_000L;
 		final boolean cont = request.has("continue") && request.get("continue").getAsBoolean();
 		final long started = System.currentTimeMillis();
-		if (checker != null && checkerThread != null && checkerThread.isAlive()) {
-			checker.stop();
-			checkerThread.join(10_000);
-		}
 		recorder.drainMessages();
+		// Decided before parsing, so these paths leave TLC's statics alone.
+		final String currentConfig = readConfig();
+		String before = null;
+		if (currentConfig == null || !currentConfig.equals(configText)) {
+			before = "the model config changed";
+		} else if (refreshed ? !refreshComplete : !explorationComplete()) {
+			before = "the previous exploration did not finish, so the store is not the whole graph";
+		}
+		if (before != null) {
+			return fullRerun(ok(), before, started);
+		}
 		final Tool oldTool = tool;
 		final GraphStore oldStore = store;
 		final Tool newTool;
@@ -843,21 +916,16 @@ public final class Resident {
 			final JsonObject reply = error(null, "parse_failed", t.toString());
 			reply.add("messages", recorder.drainMessages());
 			// The old tool and store stay in place.
+			rebindStatics(oldTool);
 			return reply;
 		}
-		final Incremental.ActionDiff diff = Incremental.diff(oldTool, newTool, oldStore);
+		final Incremental.ActionDiff diff = Incremental.diff(oldTool, newTool);
 		final JsonObject reply = ok();
 		reply.add("diff", Incremental.diffJson(diff));
 		reply.addProperty("front_end_ms", System.currentTimeMillis() - started);
-		if (diff.fullRerunReason != null || oldStore == null) {
-			// Nothing can be carried. A second checker in this JVM trips over
-			// TLC's per-process state (worker and trace bookkeeping), so the
-			// caller restarts the resident for the full run; the old tool
-			// and store stay in place until then.
-			reply.addProperty("mode", "full");
-			reply.addProperty("restart_required", true);
-			reply.addProperty("reason", diff.fullRerunReason != null ? diff.fullRerunReason : "nothing to carry");
-			return reply;
+		if (diff.fullRerunReason != null) {
+			rebindStatics(oldTool);
+			return fullRerun(reply, diff.fullRerunReason, started);
 		}
 		reply.addProperty("mode", "incremental");
 		final String newMetadir = FileUtil.makeMetaDir(new Date(System.currentTimeMillis()), specDir, null);
@@ -867,6 +935,10 @@ public final class Resident {
 		store = newStore;
 		metadir = newMetadir;
 		refreshed = true;
+		// Only a replay that ran to the end holds the whole graph: one cut
+		// by its budget, an error or a first violation leaves states whose
+		// successors were never generated.
+		refreshComplete = !r.budgetExhausted && r.error == null && (cont || r.violations.isEmpty());
 		reply.addProperty("survivors", r.survivors);
 		reply.addProperty("dropped", r.dropped);
 		reply.addProperty("reexpanded", r.reexpanded);
@@ -943,6 +1015,56 @@ public final class Resident {
 		reply.add("store", storeInfo());
 		reply.add("messages", recorder.drainMessages());
 		return reply;
+	}
+
+	/**
+	 * Nothing can be carried. A second checker in this JVM trips over TLC's
+	 * per-process state (worker and trace bookkeeping), so the caller
+	 * restarts the resident for the full run; the old tool and store stay in
+	 * place until then.
+	 */
+	private JsonObject fullRerun(final JsonObject reply, final String reason, final long started) {
+		reply.addProperty("mode", "full");
+		reply.addProperty("restart_required", true);
+		reply.addProperty("reason", reason);
+		reply.addProperty("duration_ms", System.currentTimeMillis() - started);
+		reply.add("messages", recorder.drainMessages());
+		return reply;
+	}
+
+	/** The model config's text, or null when it cannot be read. */
+	private String readConfig() {
+		try {
+			return new String(java.nio.file.Files.readAllBytes(new File(specDir, configName + ".cfg").toPath()),
+					StandardCharsets.UTF_8);
+		} catch (final IOException e) {
+			return null;
+		}
+	}
+
+	/**
+	 * Rebind TLC's static variable tables to {@code old} after parsing a spec
+	 * that was not adopted. Parsing assigns each variable name its slot and
+	 * sets the variable count, the empty state and the state's tool; this
+	 * puts the old spec's back. A name that was a definition of the old spec
+	 * and a variable of the new one has lost its definition slot, which
+	 * cannot be put back: the parked run then must not resume.
+	 */
+	private void rebindStatics(final Tool old) {
+		final tla2sany.semantic.OpDeclNode[] vars = old.getSpecProcessor().getVariablesNodes();
+		for (int i = 0; i < vars.length; i++) {
+			vars[i].getName().setLoc(i);
+		}
+		util.UniqueString.setVariableCount(vars.length);
+		tlc2.tool.TLCStateMut.setVariables(vars);
+		tlc2.tool.TLCStateMut.setTool(old);
+		final OpDefNode[] defs = old.getSpecProcessor().getRootModule().getOpDefs();
+		for (final OpDefNode def : defs == null ? new OpDefNode[0] : defs) {
+			if (def.getName().getVarLoc() >= 0) {
+				restartRequired = "parsing the edited spec reassigned the definition " + def.getName();
+				return;
+			}
+		}
 	}
 
 	/** The path from an initial state to a stored fingerprint. */

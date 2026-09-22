@@ -26,32 +26,43 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
+import tla2sany.semantic.ASTConstants;
+import tla2sany.semantic.ExprNode;
+import tla2sany.semantic.OpApplNode;
+import tla2sany.semantic.OpArgNode;
+import tla2sany.semantic.OpDeclNode;
 import tla2sany.semantic.OpDefNode;
+import tla2sany.semantic.SemanticNode;
+import tla2sany.semantic.SymbolNode;
 import tlc2.tool.Action;
 import tlc2.tool.StateVec;
 import tlc2.tool.TLCState;
 import tlc2.tool.impl.Tool;
+import tlc2.util.Context;
 import tlc2.util.Vect;
 
 /**
  * Re-explore after a spec edit, doing only the work the edit requires.
  *
  * <p>
- * The edited spec is parsed into a new {@link Tool}. Actions and invariants
- * are paired with the old ones by name and compared by source text, and an
- * action or invariant also counts as changed when any changed operator
- * definition of the root module is named in its text (a conservative
- * approximation of "depends on"). If the variables, the initial predicate or
- * the model config changed, nothing can be reused and the caller runs a
- * fresh exploration instead.
+ * The edited spec is parsed into a new {@link Tool}. Every action, invariant,
+ * initial predicate, constraint, view and symmetry set gets a signature: its
+ * own source text, the text of every user definition it reaches
+ * (transitively, across modules), and the values its context binds (the
+ * {@code p} of an action split out of {@code \E p \in S : A(p)}). Actions are
+ * paired with the old ones by name and signature; invariants by name. If the
+ * variables, the initial predicate, a state or action constraint, the view or
+ * the symmetry set changed, nothing can be reused and the caller runs a fresh
+ * exploration instead; so does the caller when the model config changed or
+ * the old exploration did not finish.
  *
  * <p>
  * Otherwise the old store's graph is replayed: the states reachable from the
@@ -62,7 +73,9 @@ import tlc2.util.Vect;
  * invariant, and every surviving state against the changed invariants.
  * Successor generation, constraints and invariant evaluation all go through
  * the new {@link Tool}, so the store is a cache of TLC's own answers, never
- * an oracle of its own.
+ * an oracle of its own. Copying an edge is sound only because the old store
+ * holds a fully explored graph under the same constraints: every in-model
+ * successor of a stored state under an unchanged action is already an edge.
  *
  * <p>
  * Not covered here: liveness (the tableau is not rebuilt), deadlock
@@ -118,19 +131,16 @@ public final class Incremental {
 	}
 
 	/** Pair the old and new specs' actions, invariants and definitions. */
-	public static ActionDiff diff(final Tool oldTool, final Tool newTool, final GraphStore oldStore) {
+	public static ActionDiff diff(final Tool oldTool, final Tool newTool) {
 		final ActionDiff d = new ActionDiff();
-		// Variables.
-		final String[] oldVars = TLCState.Empty == null ? new String[0] : oldStore.variableNames();
-		final List<String> newVars = new ArrayList<>();
-		for (final tla2sany.semantic.OpDeclNode v : newTool.getSpecProcessor().getVariablesNodes()) {
-			newVars.add(v.getName().toString());
-		}
-		if (!new ArrayList<>(List.of(oldVars)).equals(newVars)) {
+		// Variables, from each tool's own declarations: TLC's static variable
+		// table (behind the store's decoding) already belongs to the new parse.
+		if (!variableNames(oldTool).equals(variableNames(newTool))) {
 			d.fullRerunReason = "the variables changed";
 			return d;
 		}
-		// Definitions of the root module, by name.
+		// Definitions of the root module, by name (reported, not decisive:
+		// the signatures below decide what changed).
 		final Map<String, String> oldDefs = definitions(oldTool);
 		final Map<String, String> newDefs = definitions(newTool);
 		for (final Map.Entry<String, String> e : newDefs.entrySet()) {
@@ -144,43 +154,44 @@ public final class Incremental {
 				d.changedDefinitions.add(name);
 			}
 		}
-		// Initial predicate.
-		if (!initText(oldTool).equals(initText(newTool)) || mentionsChanged(initText(newTool), d.changedDefinitions)) {
+		// What every explored state and edge was filtered or identified by.
+		if (!initSignature(oldTool).equals(initSignature(newTool))) {
 			d.fullRerunReason = "the initial predicate changed";
 			return d;
 		}
-		// Actions.
-		final Map<String, Action> oldByName = new LinkedHashMap<>();
-		for (final Action a : oldTool.getActions()) {
-			oldByName.put(a.getNameOfDefault() + "|" + a.getId(), a);
+		if (!constraintSignature(oldTool).equals(constraintSignature(newTool))) {
+			d.fullRerunReason = "a state or action constraint changed";
+			return d;
 		}
+		if (!fingerprintSignature(oldTool).equals(fingerprintSignature(newTool))) {
+			d.fullRerunReason = "the view or the symmetry set changed";
+			return d;
+		}
+		// Actions.
 		final Map<String, List<Action>> oldByKey = new HashMap<>();
+		final Map<Integer, String> oldSig = new HashMap<>();
 		for (final Action a : oldTool.getActions()) {
 			oldByKey.computeIfAbsent(a.getNameOfDefault(), k -> new ArrayList<>()).add(a);
+			oldSig.put(a.getId(), signature(a));
 		}
 		final Set<Integer> matchedOld = new HashSet<>();
 		for (final Action n : newTool.getActions()) {
 			final String name = n.getNameOfDefault();
+			final String sig = signature(n);
 			final List<Action> candidates = oldByKey.getOrDefault(name, List.of());
 			Action match = null;
 			for (final Action o : candidates) {
-				if (!matchedOld.contains(o.getId()) && text(o).equals(text(n))) {
+				if (!matchedOld.contains(o.getId()) && oldSig.get(o.getId()).equals(sig)) {
 					match = o;
 					break;
 				}
 			}
-			if (match != null && !mentionsChanged(text(n), d.changedDefinitions)) {
+			if (match != null) {
 				matchedOld.add(match.getId());
 				d.carried.put(match.getId(), n);
 				d.unchanged.add(name);
-			} else if (!candidates.isEmpty()) {
-				// Same name, different text (or a dependency changed).
-				for (final Action o : candidates) {
-					if (!matchedOld.contains(o.getId())) {
-						matchedOld.add(o.getId());
-						break;
-					}
-				}
+			} else if (pairUnmatched(candidates, matchedOld)) {
+				// Same name, different signature.
 				d.changed.add(name);
 				d.reexpand.add(n);
 			} else {
@@ -198,18 +209,35 @@ public final class Incremental {
 		final String[] oldNames = oldTool.getInvNames();
 		final Action[] oldInvs = oldTool.getInvariants();
 		for (int i = 0; i < oldInvs.length; i++) {
-			oldInv.put(i < oldNames.length ? oldNames[i] : oldInvs[i].getNameOfDefault(), text(oldInvs[i]));
+			oldInv.put(i < oldNames.length ? oldNames[i] : oldInvs[i].getNameOfDefault(), signature(oldInvs[i]));
 		}
 		final String[] newNames = newTool.getInvNames();
 		final Action[] newInvs = newTool.getInvariants();
 		for (int i = 0; i < newInvs.length; i++) {
 			final String name = i < newNames.length ? newNames[i] : newInvs[i].getNameOfDefault();
-			final String t = text(newInvs[i]);
-			if (!t.equals(oldInv.get(name)) || mentionsChanged(t, d.changedDefinitions)) {
+			if (!signature(newInvs[i]).equals(oldInv.get(name))) {
 				d.changedInvariants.add(name);
 			}
 		}
 		return d;
+	}
+
+	/** Claim the first old action of {@code candidates} not yet paired; false when none is left. */
+	private static boolean pairUnmatched(final List<Action> candidates, final Set<Integer> matchedOld) {
+		for (final Action o : candidates) {
+			if (matchedOld.add(o.getId())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static List<String> variableNames(final Tool tool) {
+		final List<String> out = new ArrayList<>();
+		for (final OpDeclNode v : tool.getSpecProcessor().getVariablesNodes()) {
+			out.add(v.getName().toString());
+		}
+		return out;
 	}
 
 	private static Map<String, String> definitions(final Tool tool) {
@@ -227,31 +255,97 @@ public final class Incremental {
 		return out;
 	}
 
-	private static String initText(final Tool tool) {
-		final StringBuilder sb = new StringBuilder();
-		final Vect<Action> init = tool.getInitStateSpec();
-		for (int i = 0; i < init.size(); i++) {
-			sb.append(text(init.elementAt(i))).append('\n');
+	private static String signature(final Action a) {
+		return signature(a.pred, a.con);
+	}
+
+	/**
+	 * The text of {@code node}, the name and text of every user definition it
+	 * reaches (transitively, in name order) and the values {@code con} binds.
+	 * Two nodes with equal signatures denote the same predicate under the same
+	 * constant values, which the config pins.
+	 */
+	private static String signature(final SemanticNode node, final Context con) {
+		final StringBuilder sb = new StringBuilder(GraphStore.text(node));
+		final Map<String, String> reached = new TreeMap<>();
+		reach(node, reached, new HashSet<>());
+		for (final Map.Entry<String, String> e : reached.entrySet()) {
+			sb.append('\n').append(e.getKey()).append(" == ").append(e.getValue());
+		}
+		if (con != null && con != Context.Empty) {
+			sb.append("\nwith ").append(con);
 		}
 		return sb.toString();
 	}
 
-	/** Whether {@code text} names any of the changed definitions (a conservative dependency test). */
-	private static boolean mentionsChanged(final String text, final List<String> changed) {
-		for (final String name : changed) {
-			int at = text.indexOf(name);
-			while (at >= 0) {
-				final boolean before = at == 0 || !Character.isLetterOrDigit(text.charAt(at - 1)) && text.charAt(at - 1) != '_';
-				final int end = at + name.length();
-				final boolean after = end >= text.length()
-						|| !Character.isLetterOrDigit(text.charAt(end)) && text.charAt(end) != '_';
-				if (before && after) {
-					return true;
-				}
-				at = text.indexOf(name, at + 1);
+	private static void reach(final SemanticNode node, final Map<String, String> reached,
+			final Set<SemanticNode> seen) {
+		if (node == null || !seen.add(node)) {
+			return;
+		}
+		if (node instanceof OpApplNode) {
+			reachDefinition(((OpApplNode) node).getOperator(), reached, seen);
+		} else if (node instanceof OpArgNode) {
+			reachDefinition(((OpArgNode) node).getOp(), reached, seen);
+		}
+		final SemanticNode[] children = node.getChildren();
+		if (children != null) {
+			for (final SemanticNode c : children) {
+				reach(c, reached, seen);
 			}
 		}
-		return false;
+	}
+
+	private static void reachDefinition(final SymbolNode op, final Map<String, String> reached,
+			final Set<SemanticNode> seen) {
+		if (!(op instanceof OpDefNode)) {
+			return;
+		}
+		final OpDefNode def = (OpDefNode) op;
+		if (def.getKind() != ASTConstants.UserDefinedOpKind || def.getBody() == null) {
+			return;
+		}
+		// Keyed by module too: two modules may define the same name.
+		final String module = def.getLocation() == null ? "" : def.getLocation().source() + "!";
+		reached.put(module + def.getName(), GraphStore.text(def.getBody()));
+		reach(def.getBody(), reached, seen);
+	}
+
+	private static String initSignature(final Tool tool) {
+		final StringBuilder sb = new StringBuilder();
+		final Vect<Action> init = tool.getInitStateSpec();
+		for (int i = 0; i < init.size(); i++) {
+			sb.append(signature(init.elementAt(i))).append('\n');
+		}
+		return sb.toString();
+	}
+
+	private static String constraintSignature(final Tool tool) {
+		final StringBuilder sb = new StringBuilder();
+		for (final ExprNode c : tool.getModelConstraints()) {
+			sb.append("state ").append(signature(c, null)).append('\n');
+		}
+		for (final ExprNode c : tool.getActionConstraints()) {
+			sb.append("action ").append(signature(c, null)).append('\n');
+		}
+		return sb.toString();
+	}
+
+	/** The view and symmetry set: they decide what a fingerprint identifies. */
+	private static String fingerprintSignature(final Tool tool) {
+		final StringBuilder sb = new StringBuilder();
+		sb.append("view ").append(signature(tool.getViewSpec(), null)).append('\n');
+		final String symmetry = tool.getModelConfig().getSymmetry();
+		if (symmetry != null && !symmetry.isEmpty()) {
+			sb.append("symmetry ").append(symmetry);
+			final OpDefNode[] defs = tool.getSpecProcessor().getRootModule().getOpDefs();
+			for (final OpDefNode def : defs == null ? new OpDefNode[0] : defs) {
+				if (def.getName().toString().equals(symmetry)) {
+					sb.append(' ').append(signature(def.getBody(), null));
+				}
+			}
+		}
+		return sb.toString();
 	}
 
 	/**
