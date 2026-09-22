@@ -64,6 +64,12 @@ import tlc2.value.ValueOutputStream;
  * to offset, level and first predecessor) and the predecessor lists stay in
  * memory. Blocked guards are tallied, not logged: per (action, conjunct)
  * a count, one example state and one example binding.
+ *
+ * <p>
+ * The in-memory part is not bounded: roughly a hundred bytes of heap per
+ * state and fifty per edge, on top of the checker's own. It suits the specs
+ * one iterates on interactively; for a large run, open the resident with
+ * {@code store: false} (no store, no store queries) or give the JVM the heap.
  */
 public final class GraphStore implements IStateWriter {
 
@@ -115,6 +121,11 @@ public final class GraphStore implements IStateWriter {
 	private long edges;
 	private long unsatisfied;
 	private TLCState empty;
+	/** Serialised states not yet written to {@link #content}; flushed before a read. */
+	private final ByteArrayOutputStream pending = new ByteArrayOutputStream(1 << 16);
+	/** Bytes in {@link #content} plus {@link #pending}: the next state's offset. */
+	private long length;
+	private static final int FLUSH_AT = 1 << 20;
 
 	public GraphStore(final String metadir) throws IOException {
 		this.file = new File(metadir, "basis.states");
@@ -133,12 +144,15 @@ public final class GraphStore implements IStateWriter {
 	// ─── what the checker writes ────────────────────────────────────────
 
 	@Override
-	public synchronized void writeState(final TLCState state) {
+	public void writeState(final TLCState state) {
 		// An initial state.
 		final long fp = state.fingerPrint();
-		if (!index.containsKey(fp)) {
-			store(fp, state, 1, 0, -1);
-			initial.add(fp);
+		final byte[] data = serialise(state);
+		synchronized (this) {
+			if (!index.containsKey(fp)) {
+				store(fp, data, 1, 0, -1);
+				initial.add(fp);
+			}
 		}
 	}
 
@@ -148,30 +162,36 @@ public final class GraphStore implements IStateWriter {
 	}
 
 	@Override
-	public synchronized void writeState(final TLCState state, final TLCState successor, final short stateFlags,
+	public void writeState(final TLCState state, final TLCState successor, final short stateFlags,
 			final Action action) {
 		if (isSet(stateFlags, IsNotInModel)) {
 			return;
 		}
+		// Fingerprinting and serialising run outside the lock: every worker
+		// writes every edge here, so the lock covers only the maps.
 		final long from = state.fingerPrint();
 		final long to = successor.fingerPrint();
 		final int actionId = action == null ? -1 : action.getId();
-		if (action != null) {
-			actions.putIfAbsent(actionId, action);
-		}
-		edges++;
 		// Keep the content of the write that won TLC's fingerprint-set put
 		// (IsUnseen): that is the state TLC enqueued and whose successors the
 		// store records. Under a VIEW or SYMMETRY another worker may reach the
 		// same fingerprint with a different concrete state, and its (IsSeen)
 		// write can take this lock first.
-		if (isSet(stateFlags, IsUnseen) && !index.containsKey(to)) {
-			final Entry pred = index.get(from);
-			store(to, successor, pred == null ? 2 : pred.level + 1, from, actionId);
+		final byte[] data = isSet(stateFlags, IsUnseen) ? serialise(successor) : null;
+		synchronized (this) {
+			if (action != null) {
+				actions.putIfAbsent(actionId, action);
+			}
+			edges++;
+			if (data != null && !index.containsKey(to)) {
+				final Entry pred = index.get(from);
+				store(to, data, pred == null ? 2 : pred.level + 1, from, actionId);
+			}
+			final LongVec preds = predecessors.computeIfAbsent(to, k -> new LongVec(4));
+			preds.addElement(from);
+			preds.addElement(actionId);
+			preds.addElement(stateFlags);
 		}
-		predecessors.computeIfAbsent(to, k -> new LongVec(4)).addElement(from);
-		predecessors.get(to).addElement(actionId);
-		predecessors.get(to).addElement(stateFlags);
 	}
 
 	@Override
@@ -240,14 +260,37 @@ public final class GraphStore implements IStateWriter {
 
 	/**
 	 * The checker closes its state writer when a run ends; the store outlives
-	 * the run, so this only flushes. The file goes away with the process.
+	 * the run, so this only flushes. {@link #dispose()} releases it.
 	 */
 	@Override
-	public void close() {
+	public synchronized void close() {
 		try {
+			flush();
 			content.getFD().sync();
 		} catch (final IOException e) {
 			// Nothing to report to.
+		}
+	}
+
+	/**
+	 * Release the store for good: close its file, delete it, and delete its
+	 * directory when nothing else is left in it (a refresh's own metadir; the
+	 * checker's metadir holds TLC's files too and stays).
+	 */
+	public synchronized void dispose() {
+		try {
+			content.close();
+		} catch (final IOException e) {
+			// Deleting below is what matters.
+		}
+		pending.reset();
+		file.delete();
+		final File dir = file.getParentFile();
+		if (dir != null) {
+			final String[] left = dir.list();
+			if (left != null && left.length == 0) {
+				dir.delete();
+			}
 		}
 	}
 
@@ -273,36 +316,89 @@ public final class GraphStore implements IStateWriter {
 	}
 
 	@Override
-	public void snapshot() throws IOException {
+	public synchronized void snapshot() throws IOException {
+		flush();
 		content.getFD().sync();
 	}
 
 	// ─── storing and reading content ────────────────────────────────────
 
-	private void store(final long fp, final TLCState state, final int level, final long predecessor,
-			final int action) {
+	/**
+	 * A state's variable values as bytes. Only the values: the TLCState
+	 * header (worker id, uid, level) is unset on the states the writer hook
+	 * receives, and the nat encodings reject negative values.
+	 */
+	private static byte[] serialise(final TLCState state) {
+		final Serialiser ser = SERIALISER.get();
 		try {
-			// Only the variables' values: the TLCState header (worker id, uid,
-			// level) is unset on the states the writer hook receives, and the
-			// nat encodings reject negative values.
-			final ByteArrayOutputStream bytes = new ByteArrayOutputStream(256);
-			final ValueOutputStream vos = new ValueOutputStream(bytes, false);
+			ser.bytes.reset();
+			ser.vos.reset();
 			for (final tla2sany.semantic.OpDeclNode var : state.getVars()) {
 				final tlc2.value.IValue value = state.lookup(var.getName());
 				if (value == null) {
 					throw new IOException("unassigned variable " + var.getName() + " in a stored state");
 				}
-				value.write(vos);
+				value.write(ser.vos);
 			}
-			vos.close();
-			final byte[] data = bytes.toByteArray();
-			final long offset = content.length();
-			content.seek(offset);
-			content.write(data);
-			index.put(fp, new Entry(offset, data.length, level, predecessor, action));
+			ser.vos.reset();
+			return ser.bytes.toByteArray();
 		} catch (final IOException e) {
 			throw new RuntimeException("basis.states: " + e.getMessage(), e);
 		}
+	}
+
+	/**
+	 * One per worker thread: a value stream costs an 8 KiB buffer to build,
+	 * and every stored state is serialised on the worker that reached it.
+	 */
+	private static final class Serialiser {
+		final ByteArrayOutputStream bytes = new ByteArrayOutputStream(256);
+		final ValueOutputStream vos;
+
+		Serialiser() {
+			try {
+				vos = new ValueOutputStream(bytes, false);
+			} catch (final IOException e) {
+				throw new RuntimeException(e);
+			}
+		}
+	}
+
+	private static final ThreadLocal<Serialiser> SERIALISER = ThreadLocal.withInitial(Serialiser::new);
+
+	/** Append serialised content; the file write is batched. Caller holds the lock. */
+	private void store(final long fp, final byte[] data, final int level, final long predecessor,
+			final int action) {
+		final long offset = length;
+		pending.write(data, 0, data.length);
+		length += data.length;
+		index.put(fp, new Entry(offset, data.length, level, predecessor, action));
+		if (pending.size() >= FLUSH_AT) {
+			try {
+				flush();
+			} catch (final IOException e) {
+				throw new RuntimeException("basis.states: " + e.getMessage(), e);
+			}
+		}
+	}
+
+	private void flush() throws IOException {
+		if (pending.size() == 0) {
+			return;
+		}
+		content.seek(content.length());
+		pending.writeTo(new java.io.OutputStream() {
+			@Override
+			public void write(final int b) throws IOException {
+				content.write(b);
+			}
+
+			@Override
+			public void write(final byte[] b, final int off, final int len) throws IOException {
+				content.write(b, off, len);
+			}
+		});
+		pending.reset();
 	}
 
 	/** The stored state with this fingerprint, or null. */
@@ -312,6 +408,7 @@ public final class GraphStore implements IStateWriter {
 			return null;
 		}
 		try {
+			flush();
 			final byte[] data = new byte[e.length];
 			content.seek(e.offset);
 			content.readFully(data);
@@ -435,10 +532,6 @@ public final class GraphStore implements IStateWriter {
 	}
 
 	public synchronized long bytes() {
-		try {
-			return content.length();
-		} catch (final IOException e) {
-			return -1;
-		}
+		return length;
 	}
 }

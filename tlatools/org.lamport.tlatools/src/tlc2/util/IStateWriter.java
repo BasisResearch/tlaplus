@@ -69,11 +69,16 @@ public interface IStateWriter {
 	 * A guard conjunct {@code pred} of {@code action} evaluated false at
 	 * {@code state} under the bindings in {@code c}, so the transition to
 	 * {@code successor} was not taken. Delivered only to a constrained writer.
-	 * The default keeps the older signature's behaviour and drops the context.
+	 * {@code successor} may have unassigned variables (a guard can fail before
+	 * any primed variable is assigned). The default keeps the older behaviour:
+	 * it drops the context and forwards only a fully assigned successor, the
+	 * only kind upstream writers ever received here.
 	 */
 	default void writeUnsatisfied(TLCState state, Action action, TLCState successor, SemanticNode pred,
 			tlc2.util.Context c) {
-		writeState(state, successor, IsNotInModel, action, pred);
+		if (successor != null && successor.allAssigned()) {
+			writeState(state, successor, IsNotInModel, action, pred);
+		}
 	}
 
 	void writeState(TLCState state, TLCState successor, short stateFlags, Visualization visualization);

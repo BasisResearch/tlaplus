@@ -78,7 +78,9 @@ import util.ToolIO;
  * catalogue: actions, invariants, implied actions, temporal properties and
  * variables. Nothing is explored yet. {@code workers} sets the thread count,
  * {@code metadir} where TLC keeps its state files, {@code deadlock} (default
- * true) whether deadlocks are violations.</li>
+ * true) whether deadlocks are violations, {@code store} (default true)
+ * whether to keep the {@link GraphStore} the store queries and refresh
+ * need (it costs heap per state and edge).</li>
  * <li>{@code check}: explore, resuming where the last check stopped, until
  * the reachable graph is exhausted, a violation is found, or the budget runs
  * out: {@code budget_ms} of wall time, {@code budget_states} distinct
@@ -101,8 +103,17 @@ public final class Resident {
 	private ModelChecker checker;
 	/** True after an incremental refresh: the store is current, the checker is not. */
 	private boolean refreshed;
-	/** After an incremental refresh: whether the replay explored the whole graph. */
-	private boolean refreshComplete;
+	/**
+	 * The last fully explored graph and the tool it was explored under: what
+	 * the next refresh replays from. Set by the first refresh from a finished
+	 * run and advanced only by a refresh that explored its whole graph, so a
+	 * refresh cut short (by its budget or a first violation) leaves the next
+	 * one something sound to copy edges from.
+	 */
+	private Tool baseTool;
+	private GraphStore baseStore;
+	/** False when opened with {@code store: false}: no store, no store queries. */
+	private boolean storing = true;
 	/**
 	 * Set when a refresh that did not replace the tool left TLC's static
 	 * tables unfit for the parked checker to resume: why a restart is needed.
@@ -141,8 +152,7 @@ public final class Resident {
 		ToolIO.err = sink;
 		ToolIO.setMode(ToolIO.TOOL);
 
-		final Resident resident = new Resident();
-		MP.setRecorder(resident.recorder);
+		final Resident resident = install();
 
 		final JsonObject ready = new JsonObject();
 		ready.addProperty("event", "ready");
@@ -184,6 +194,18 @@ public final class Resident {
 		}
 		resident.shutdown();
 		System.exit(0);
+	}
+
+	/** A resident whose recorder receives TLC's messages; TLC's statics allow one per process. */
+	static Resident install() {
+		final Resident resident = new Resident();
+		MP.setRecorder(resident.recorder);
+		return resident;
+	}
+
+	/** Serve one request, as a line of standard input would be served (the tests' entry). */
+	JsonObject serve(final JsonObject request) throws Exception {
+		return dispatch(string(request, "command", ""), request);
 	}
 
 	private JsonObject dispatch(final String command, final JsonObject request) throws Exception {
@@ -273,6 +295,7 @@ public final class Resident {
 		final boolean deadlock = !request.has("deadlock") || request.get("deadlock").getAsBoolean();
 		final boolean coverage = !request.has("coverage") || request.get("coverage").getAsBoolean();
 		final int fpIndex = request.has("fp_index") ? request.get("fp_index").getAsInt() : 0;
+		storing = !request.has("store") || request.get("store").getAsBoolean();
 		if (request.has("metadir")) {
 			TLCGlobals.metaDir = new File(request.get("metadir").getAsString()).getAbsolutePath()
 					+ FileUtil.separator;
@@ -301,8 +324,9 @@ public final class Resident {
 			final boolean checkDeadlock = deadlock && tool.getModelConfig().getCheckDeadlock();
 			this.checkDeadlock = checkDeadlock;
 			configText = readConfig();
-			store = new GraphStore(metadir);
-			checker = new ModelChecker(tool, metadir, store, checkDeadlock, null,
+			store = storing ? new GraphStore(metadir) : null;
+			checker = new ModelChecker(tool, metadir,
+					storing ? store : new tlc2.util.NoopStateWriter(), checkDeadlock, null,
 					FPSetFactory.getFPSetInitialized(new FPSetConfiguration(), metadir, specFile.getName()),
 					openedAt);
 			TLCGlobals.mainChecker = checker;
@@ -322,6 +346,7 @@ public final class Resident {
 		reply.addProperty("check_deadlock", deadlock && tool.getModelConfig().getCheckDeadlock());
 		reply.addProperty("coverage", coverage);
 		reply.addProperty("fp_index", fpIndex);
+		reply.addProperty("store", storing);
 		reply.add("catalogue", catalogue());
 		reply.add("messages", recorder.drainMessages());
 		return reply;
@@ -542,7 +567,11 @@ public final class Resident {
 		TLCGlobals.continuationTraceLimit = request.has("traces_per_property")
 				? request.get("traces_per_property").getAsInt()
 				: 1;
-		TLCGlobals.resetContinuationTraces();
+		if (checkerThread == null) {
+			// The cap is per run: a resumed run keeps its count, so a later
+			// call does not print another trace for a property already traced.
+			TLCGlobals.resetContinuationTraces();
+		}
 
 		if (resultCode == null && checkerFailure == null) {
 			if (checkerThread == null) {
@@ -850,6 +879,9 @@ public final class Resident {
 	// ─── the store's queries ────────────────────────────────────────────
 
 	private JsonObject notOpen() {
+		if (tool != null && !storing) {
+			return error(null, "no_store", "this session was opened with store: false; reopen with the store to query it");
+		}
 		return error(null, "not_open", "open a spec first");
 	}
 
@@ -874,8 +906,15 @@ public final class Resident {
 	 * Re-parse the spec after an edit and re-explore only what the edit
 	 * reaches (see {@link Incremental}). A change to the variables, the
 	 * initial predicate, a constraint, the view, the symmetry set or the
-	 * config, or an old exploration that did not finish, leaves nothing to
-	 * carry: the reply asks for a restart and a full run.
+	 * config, or a first run that did not finish, leaves nothing to carry:
+	 * the reply asks for a restart and a full run.
+	 *
+	 * <p>
+	 * The replay starts from the last fully explored graph ({@link #baseStore}),
+	 * not necessarily the current store: a refresh cut short by its budget or
+	 * a first violation is served to the store queries but not replayed from.
+	 * A replay that fails (the edited spec does not evaluate) is not adopted:
+	 * the current tool and store stay.
 	 *
 	 * <p>
 	 * A paused checker is left parked, not stopped: stopping ends its run as
@@ -898,16 +937,21 @@ public final class Resident {
 		// Decided before parsing, so these paths leave TLC's statics alone.
 		final String currentConfig = readConfig();
 		String before = null;
-		if (currentConfig == null || !currentConfig.equals(configText)) {
+		if (!storing) {
+			before = "the session was opened without a store, so there is no graph to replay";
+		} else if (currentConfig == null || !currentConfig.equals(configText)) {
 			before = "the model config changed";
-		} else if (refreshed ? !refreshComplete : !explorationComplete()) {
+		} else if (!refreshed && !explorationComplete()) {
 			before = "the previous exploration did not finish, so the store is not the whole graph";
 		}
 		if (before != null) {
 			return fullRerun(ok(), before, started);
 		}
-		final Tool oldTool = tool;
-		final GraphStore oldStore = store;
+		if (baseStore == null) {
+			// The first refresh, from a run that explored the whole graph.
+			baseTool = tool;
+			baseStore = store;
+		}
 		final Tool newTool;
 		try {
 			newTool = new FastTool(mainFile, configName, new SimpleFilenameToStream(specDir), Tool.Mode.MC,
@@ -915,30 +959,23 @@ public final class Resident {
 		} catch (final Throwable t) {
 			final JsonObject reply = error(null, "parse_failed", t.toString());
 			reply.add("messages", recorder.drainMessages());
-			// The old tool and store stay in place.
-			rebindStatics(oldTool);
+			// The current tool and store stay in place.
+			rebindStatics(tool);
 			return reply;
 		}
-		final Incremental.ActionDiff diff = Incremental.diff(oldTool, newTool);
+		final Incremental.ActionDiff diff = Incremental.diff(baseTool, newTool);
 		final JsonObject reply = ok();
 		reply.add("diff", Incremental.diffJson(diff));
 		reply.addProperty("front_end_ms", System.currentTimeMillis() - started);
 		if (diff.fullRerunReason != null) {
-			rebindStatics(oldTool);
+			rebindStatics(tool);
 			return fullRerun(reply, diff.fullRerunReason, started);
 		}
 		reply.addProperty("mode", "incremental");
+		reply.addProperty("replayed_from", baseStore == store ? "current" : "last_complete");
 		final String newMetadir = FileUtil.makeMetaDir(new Date(System.currentTimeMillis()), specDir, null);
 		final GraphStore newStore = new GraphStore(newMetadir);
-		final Incremental.Result r = Incremental.replay(newTool, oldStore, newStore, diff, budgetMs, cont);
-		tool = newTool;
-		store = newStore;
-		metadir = newMetadir;
-		refreshed = true;
-		// Only a replay that ran to the end holds the whole graph: one cut
-		// by its budget, an error or a first violation leaves states whose
-		// successors were never generated.
-		refreshComplete = !r.budgetExhausted && r.error == null && (cont || r.violations.isEmpty());
+		final Incremental.Result r = Incremental.replay(newTool, baseStore, newStore, diff, budgetMs, cont);
 		reply.addProperty("survivors", r.survivors);
 		reply.addProperty("dropped", r.dropped);
 		reply.addProperty("reexpanded", r.reexpanded);
@@ -946,10 +983,40 @@ public final class Resident {
 		reply.addProperty("edges_copied", r.edgesCopied);
 		reply.addProperty("edges_generated", r.edgesGenerated);
 		reply.addProperty("budget_exhausted", r.budgetExhausted);
-		reply.addProperty("finished", !r.budgetExhausted && r.error == null);
 		if (r.error != null) {
+			// The edited spec does not evaluate; keep serving what was there.
+			newStore.dispose();
+			rebindStatics(tool);
+			reply.addProperty("adopted", false);
+			reply.addProperty("finished", false);
+			reply.addProperty("complete", false);
 			reply.addProperty("error", r.error);
+			reply.addProperty("duration_ms", System.currentTimeMillis() - started);
+			reply.add("store", storeInfo());
+			reply.add("messages", recorder.drainMessages());
+			return reply;
 		}
+		final GraphStore previous = store;
+		tool = newTool;
+		store = newStore;
+		metadir = newMetadir;
+		refreshed = true;
+		// Only a replay that ran to the end holds the whole graph: one cut
+		// by its budget or a first violation leaves states whose successors
+		// were never generated. Such a store is served, not replayed from.
+		final boolean stoppedAtViolation = !cont && !r.violations.isEmpty();
+		final boolean complete = !r.budgetExhausted && !stoppedAtViolation;
+		if (complete) {
+			final GraphStore oldBase = baseStore;
+			baseTool = newTool;
+			baseStore = newStore;
+			retire(oldBase);
+		}
+		retire(previous);
+		reply.addProperty("adopted", true);
+		reply.addProperty("finished", !r.budgetExhausted);
+		reply.addProperty("complete", complete);
+		reply.addProperty("stopped_at_first_violation", stoppedAtViolation);
 		final JsonArray violations = new JsonArray();
 		for (final Incremental.Violation v : r.violations) {
 			final JsonObject o = new JsonObject();
@@ -959,11 +1026,10 @@ public final class Resident {
 			violations.add(o);
 		}
 		// Per-invariant verdicts: exact over the refreshed store when the
-		// replay finished (one evaluation per state and invariant), else
-		// not_evaluated.
+		// replay explored the whole graph (one evaluation per state and
+		// invariant), else not_evaluated.
 		final JsonArray invs = new JsonArray();
-		final boolean finished = !r.budgetExhausted && r.error == null;
-		if (finished && (cont || r.violations.isEmpty())) {
+		if (complete) {
 			final JsonArray exact = new JsonArray();
 			for (final Incremental.Sweep sw : Incremental.sweep(tool, store)) {
 				final JsonObject v = new JsonObject();
@@ -1011,10 +1077,40 @@ public final class Resident {
 			reply.add("violations", violations);
 		}
 		reply.add("invariants", invs);
+		reply.add("unchecked", unchecked());
 		reply.addProperty("duration_ms", System.currentTimeMillis() - started);
 		reply.add("store", storeInfo());
 		reply.add("messages", recorder.drainMessages());
 		return reply;
+	}
+
+	/**
+	 * What a refresh does not recheck, so a caller does not read the
+	 * invariant verdicts as the whole answer: temporal properties (the
+	 * liveness tableau is not rebuilt), implied actions, deadlock, and the
+	 * blocked-guard tallies (not recorded during a replay).
+	 */
+	private JsonObject unchecked() {
+		final JsonObject o = new JsonObject();
+		final JsonArray temporals = new JsonArray();
+		for (final Action a : tool.getTemporals()) {
+			temporals.add(a.getNameOfDefault());
+		}
+		for (final Action a : tool.getImpliedTemporals()) {
+			temporals.add(a.getNameOfDefault());
+		}
+		o.add("temporal_properties", temporals);
+		o.add("implied_actions", names(tool.getImpliedActNames()));
+		o.addProperty("deadlock", checkDeadlock);
+		o.addProperty("guard_tallies", true);
+		return o;
+	}
+
+	/** Release a store nothing refers to any more. */
+	private void retire(final GraphStore s) {
+		if (s != null && s != store && s != baseStore) {
+			s.dispose();
+		}
 	}
 
 	/**
@@ -1348,11 +1444,18 @@ public final class Resident {
 		reply.addProperty("unsatisfied", store.unsatisfied());
 		reply.add("blocked", rows);
 		reply.addProperty("note",
-				"attribution is to the first guard conjunct that evaluated false in TLC's evaluation order, on the all-assigned path only");
+				"count is how often the subexpression evaluated false while TLC generated the action's successors, "
+						+ "attributed to the first false conjunct in TLC's evaluation order. Under a disjunction each "
+						+ "false disjunct is counted, even when another disjunct let the action fire");
+		if (refreshed) {
+			reply.addProperty("stale", true);
+			reply.addProperty("stale_reason",
+					"the store was refreshed incrementally, and guards are not tallied during a replay; reopen for a fresh profile");
+		}
 		return reply;
 	}
 
-	private void shutdown() {
+	void shutdown() {
 		if (simulator != null && simulatorThread != null && simulatorThread.isAlive()) {
 			simulator.stop();
 			try {
