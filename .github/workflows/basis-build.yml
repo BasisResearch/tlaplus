@@ -80,8 +80,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: download all artifacts
+      - name: download the build artifact
         uses: actions/download-artifact@v8
+        with:
+          # Name the artifact and its directory: downloading everything
+          # unnamed lands the files in the workspace root, not in a
+          # per-artifact directory.
+          name: tla2tools
+          path: dist
 
       - name: publish per-commit release
         env:
@@ -96,7 +102,8 @@ jobs:
             echo "release $tag already exists; keeping it"
             exit 0
           fi
-          cat ./*/*.sha256 > SHA256SUMS
+          (cd dist && shasum -a 256 -c tla2tools.jar.sha256)
+          cp dist/tla2tools.jar.sha256 SHA256SUMS
           {
             printf 'Pinned Basis build of tla2tools.jar at %s.\n\n' "$GITHUB_SHA"
             printf '%s\n' '```'
@@ -107,6 +114,6 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Basis TLC build $tag" \
             --notes-file RELEASE_NOTES.md \
-            tla2tools/tla2tools.jar \
-            tla2tools/tla2tools.jar.sha256 \
+            dist/tla2tools.jar \
+            dist/tla2tools.jar.sha256 \
             SHA256SUMS
