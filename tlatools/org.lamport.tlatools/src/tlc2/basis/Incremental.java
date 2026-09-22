@@ -36,11 +36,14 @@ import com.google.gson.JsonObject;
 
 import tla2sany.semantic.ASTConstants;
 import tla2sany.semantic.ExprNode;
+import tla2sany.semantic.FormalParamNode;
 import tla2sany.semantic.OpApplNode;
 import tla2sany.semantic.OpArgNode;
 import tla2sany.semantic.OpDeclNode;
 import tla2sany.semantic.OpDefNode;
 import tla2sany.semantic.SemanticNode;
+import tla2sany.semantic.Subst;
+import tla2sany.semantic.SubstInNode;
 import tla2sany.semantic.SymbolNode;
 import tlc2.tool.Action;
 import tlc2.tool.StateVec;
@@ -264,8 +267,10 @@ public final class Incremental {
 	}
 
 	/**
-	 * The text of {@code node}, the name and text of every user definition it
-	 * reaches (transitively, in name order) and the values {@code con} binds.
+	 * The text of {@code node}, the name, formal parameters and text of every
+	 * user definition it reaches (transitively, in name order), the
+	 * substitutions of every INSTANCE it passes through and the values
+	 * {@code con} binds.
 	 * Two nodes with equal signatures denote the same predicate under the same
 	 * constant values, which the config pins.
 	 */
@@ -291,6 +296,15 @@ public final class Incremental {
 			reachDefinition(((OpApplNode) node).getOperator(), reached, seen);
 		} else if (node instanceof OpArgNode) {
 			reachDefinition(((OpArgNode) node).getOp(), reached, seen);
+		} else if (node instanceof SubstInNode) {
+			// INSTANCE ... WITH a <- e: which parameter each expression
+			// replaces is not in any definition's text.
+			final StringBuilder with = new StringBuilder();
+			for (final Subst s : ((SubstInNode) node).getSubsts()) {
+				with.append(s.getOp().getName()).append(" <- ").append(GraphStore.text(s.getExpr())).append(", ");
+			}
+			// Keyed by content, not location, so moving the text is no edit.
+			reached.put("WITH " + with, "");
 		}
 		final SemanticNode[] children = node.getChildren();
 		if (children != null) {
@@ -311,7 +325,13 @@ public final class Incremental {
 		}
 		// Keyed by module too: two modules may define the same name.
 		final String module = def.getLocation() == null ? "" : def.getLocation().source() + "!";
-		reached.put(module + def.getName(), GraphStore.text(def.getBody()));
+		// The formal parameters too: F(a, b) == a - b and F(b, a) == a - b
+		// share their body text.
+		final StringBuilder params = new StringBuilder("(");
+		for (final FormalParamNode p : def.getParams()) {
+			params.append(p.getName()).append('/').append(p.getArity()).append(", ");
+		}
+		reached.put(module + def.getName(), params.append(") ").append(GraphStore.text(def.getBody())).toString());
 		reach(def.getBody(), reached, seen);
 	}
 

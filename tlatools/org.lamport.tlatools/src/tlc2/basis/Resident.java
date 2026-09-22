@@ -135,6 +135,13 @@ public final class Resident {
 	private boolean simulationStoppedByBudget;
 	private long simulationMs;
 	private Thread checkerThread;
+	/**
+	 * Whether the run explored past violations when it last explored: what
+	 * decides if a run that ended on a violation still covered the graph.
+	 * {@link TLCGlobals#continuation} is not it, since a later request may
+	 * set that after the run ended.
+	 */
+	private boolean runContinuation;
 	private String metadir;
 	private volatile Integer resultCode;
 	private volatile Throwable checkerFailure;
@@ -555,11 +562,6 @@ public final class Resident {
 				: Long.MAX_VALUE;
 		final long distinctAtStart = checker.getDistinctStatesGenerated();
 		final long started = System.currentTimeMillis();
-		if (request.has("continue")) {
-			// Keep exploring past a violation, so one run reports every
-			// invariant's verdict. Process-global, as TLC's -continue is.
-			TLCGlobals.continuation = request.get("continue").getAsBoolean();
-		}
 		// Traces per violated property under continuation (default 1: the
 		// first counterexample of each; later violations are counted only).
 		// Regenerating a trace re-runs the next-state relation from an initial
@@ -574,6 +576,14 @@ public final class Resident {
 		}
 
 		if (resultCode == null && checkerFailure == null) {
+			if (request.has("continue")) {
+				// Keep exploring past a violation, so one run reports every
+				// invariant's verdict. Process-global, as TLC's -continue is,
+				// and set only for a run that is about to explore: an ended
+				// run keeps the value it ran under.
+				TLCGlobals.continuation = request.get("continue").getAsBoolean();
+			}
+			runContinuation = TLCGlobals.continuation;
 			if (checkerThread == null) {
 				checkerThread = new Thread(() -> {
 					try {
@@ -640,7 +650,7 @@ public final class Resident {
 		}
 		reply.add("traces", all);
 		reply.add("invariants", invariantVerdicts(finished));
-		reply.addProperty("continuation", TLCGlobals.continuation);
+		reply.addProperty("continuation", runContinuation);
 		reply.add("stats", stats());
 		reply.add("messages", recorder.drainMessages());
 		return reply;
@@ -740,7 +750,7 @@ public final class Resident {
 		case EC.TLC_INVARIANT_VIOLATED_INITIAL:
 		case EC.TLC_INVARIANT_VIOLATED_BEHAVIOR:
 		case EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR:
-			return TLCGlobals.continuation;
+			return runContinuation;
 		default:
 			return false;
 		}
@@ -788,16 +798,16 @@ public final class Resident {
 		final boolean queueEmpty = checker.getStateQueueSize() == 0;
 		r.addProperty("finished", finished);
 		r.addProperty("exhausted", finished && queueEmpty && checkerFailure == null
-				&& (resultCode == EC.NO_ERROR || TLCGlobals.continuation));
+				&& (resultCode == EC.NO_ERROR || runContinuation));
 		r.addProperty("stopped_by", checkerFailure != null ? "error"
 				: !finished ? (checkerThread == null ? "not_started" : "budget")
 				: resultCode == EC.NO_ERROR ? "exhausted"
-				: TLCGlobals.continuation ? "exhausted_with_violations" : "violation");
+				: runContinuation ? "exhausted_with_violations" : "violation");
 		if (finished) {
 			r.addProperty("result_code", resultCode);
 		}
 		r.addProperty("workers", TLCGlobals.getNumWorkers());
-		r.addProperty("continuation", TLCGlobals.continuation);
+		r.addProperty("continuation", runContinuation);
 		r.addProperty("coverage", tlc2.tool.coverage.CoverageWalk.enabled());
 		// Out-degree across workers.
 		final JsonObject outDegree = new JsonObject();

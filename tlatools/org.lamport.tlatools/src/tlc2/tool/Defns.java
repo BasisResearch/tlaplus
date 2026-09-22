@@ -30,6 +30,8 @@ public class Defns implements ToolGlobals, Serializable
 {
     private int defnIdx;
     private Object[] table;
+    /** One past the highest slot any table in this process has handed out. */
+    private static int allocated;
 
     /**
      * Constructs the storage of initial size + 32
@@ -87,7 +89,14 @@ public class Defns implements ToolGlobals, Serializable
         int loc = key.getDefnLoc();
         if (loc == -1)
         {
-            loc = defnIdx++;
+            // Basis: a name's slot lives on its (process-global) UniqueString,
+            // so a second parse in one JVM must not hand a new name a slot an
+            // earlier parse gave another name that this table also holds.
+            synchronized (Defns.class) {
+                loc = Math.max(defnIdx, allocated);
+                defnIdx = loc + 1;
+                allocated = defnIdx;
+            }
             key.setLoc(loc);
         }
         if (loc >= this.table.length)
