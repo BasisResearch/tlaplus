@@ -84,7 +84,9 @@ public final class Recorder implements IMessagePrinterRecorder {
 		if (objects != null) {
 			for (final Object o : objects) {
 				if (o instanceof TLCStateInfo) {
-					params.add(stateInfo((TLCStateInfo) o));
+					// A stuttering tail (TLC_STATE_PRINT3) comes with a null state.
+					final TLCStateInfo info = (TLCStateInfo) o;
+					params.add(info.state == null ? JsonParser.parseString("null") : stateInfo(info));
 				} else if (o instanceof TLCState) {
 					params.add(state((TLCState) o));
 				} else if (o instanceof Object[]) {
@@ -110,6 +112,7 @@ public final class Recorder implements IMessagePrinterRecorder {
 		case EC.TLC_DEADLOCK_REACHED:
 		case EC.TLC_INVARIANT_EVALUATION_FAILED:
 			final String property = objects != null && objects.length > 0 && !(objects[0] instanceof TLCState)
+					&& !(objects[0] instanceof TLCStateInfo)
 					? String.valueOf(objects[0])
 					: null;
 			if (outcome == EC.NO_ERROR) {
@@ -128,10 +131,15 @@ public final class Recorder implements IMessagePrinterRecorder {
 				trace = new Trace();
 				trace.code = code;
 			}
-			if (objects != null && objects.length > 0 && objects[0] instanceof TLCState) {
-				final JsonObject s = state((TLCState) objects[0]);
-				s.addProperty("ordinal", trace.states.size() + 1);
-				trace.states.add(s);
+			// MP.printState wraps the state in a TLCStateInfo; a bare TLCState
+			// is kept too, for any caller that records it directly.
+			final JsonObject single = objects == null || objects.length == 0 ? null
+					: objects[0] instanceof TLCStateInfo && ((TLCStateInfo) objects[0]).state != null
+							? stateInfo((TLCStateInfo) objects[0])
+							: objects[0] instanceof TLCState ? state((TLCState) objects[0]) : null;
+			if (single != null) {
+				single.addProperty("ordinal", trace.states.size() + 1);
+				trace.states.add(single);
 			}
 			finishedTrace = trace;
 			break;
@@ -140,7 +148,8 @@ public final class Recorder implements IMessagePrinterRecorder {
 				trace = new Trace();
 				trace.code = code;
 			}
-			if (objects != null && objects.length >= 2 && objects[0] instanceof TLCStateInfo) {
+			if (objects != null && objects.length >= 2 && objects[0] instanceof TLCStateInfo
+					&& ((TLCStateInfo) objects[0]).state != null) {
 				final JsonObject s = stateInfo((TLCStateInfo) objects[0]);
 				s.addProperty("ordinal", objects[1] instanceof Integer ? (Integer) objects[1] : trace.states.size() + 1);
 				trace.states.add(s);

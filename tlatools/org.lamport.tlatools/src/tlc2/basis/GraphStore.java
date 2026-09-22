@@ -160,7 +160,12 @@ public final class GraphStore implements IStateWriter {
 			actions.putIfAbsent(actionId, action);
 		}
 		edges++;
-		if (!index.containsKey(to)) {
+		// Keep the content of the write that won TLC's fingerprint-set put
+		// (IsUnseen): that is the state TLC enqueued and whose successors the
+		// store records. Under a VIEW or SYMMETRY another worker may reach the
+		// same fingerprint with a different concrete state, and its (IsSeen)
+		// write can take this lock first.
+		if (isSet(stateFlags, IsUnseen) && !index.containsKey(to)) {
 			final Entry pred = index.get(from);
 			store(to, successor, pred == null ? 2 : pred.level + 1, from, actionId);
 		}

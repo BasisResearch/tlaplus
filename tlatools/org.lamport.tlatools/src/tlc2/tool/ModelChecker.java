@@ -698,7 +698,7 @@ public class ModelChecker extends AbstractChecker
 			return EC.NO_ERROR;
 		}
    	
-        if (this.theStateQueue.suspendAll())
+        if (this.periodicSuspend())
         {
             // Run liveness checking, if needed:
 			// The ratio set in TLCGlobals defines an upper bound for the
@@ -726,7 +726,7 @@ public class ModelChecker extends AbstractChecker
             	checkpoint();
             } else {
 				// Just resume worker threads when checkpointing is skipped
-            	this.theStateQueue.resumeAll();
+            	this.periodicResume();
             }
         }
         return EC.NO_ERROR;
@@ -745,7 +745,7 @@ public class ModelChecker extends AbstractChecker
 		}
 		// Resume the workers' state-space exploration, which potentially mutates
 		// the intern table and liveness graph.
-		this.theStateQueue.resumeAll();
+		this.periodicResume();
 		// commit checkpoint:
 		this.theStateQueue.commitChkpt();
 		this.trace.commitChkpt();
@@ -1059,8 +1059,40 @@ public class ModelChecker extends AbstractChecker
 		}
 	}
 	
+	/**
+	 * True while a caller of {@link #suspend()} holds the workers parked. The
+	 * periodic work (checkpoints, liveness checks) suspends and resumes the
+	 * queue on its own; it must not resume workers someone else has parked.
+	 */
+	private boolean held = false;
+	/** True while the periodic work has the workers parked. */
+	private boolean periodicParked = false;
+
+	private boolean periodicSuspend() {
+		synchronized (this) {
+			this.periodicParked = true;
+		}
+		final boolean suspended = this.theStateQueue.suspendAll();
+		if (!suspended) {
+			synchronized (this) {
+				this.periodicParked = false;
+			}
+		}
+		return suspended;
+	}
+
+	private void periodicResume() {
+		synchronized (this) {
+			this.periodicParked = false;
+			if (!this.held) {
+				this.theStateQueue.resumeAll();
+			}
+		}
+	}
+
 	public void suspend() {
 		synchronized (this) {
+			this.held = true;
 			this.theStateQueue.suspendAll();
 			this.notifyAll();
 		}
@@ -1068,7 +1100,11 @@ public class ModelChecker extends AbstractChecker
 
 	public void resume() {
 		synchronized (this) {
-			this.theStateQueue.resumeAll();
+			this.held = false;
+			// Periodic work in progress resumes the workers when it is done.
+			if (!this.periodicParked) {
+				this.theStateQueue.resumeAll();
+			}
 			this.notifyAll();
 		}
 	}

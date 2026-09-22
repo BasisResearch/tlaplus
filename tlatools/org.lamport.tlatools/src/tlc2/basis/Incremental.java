@@ -167,6 +167,10 @@ public final class Incremental {
 			d.fullRerunReason = "the view or the symmetry set changed";
 			return d;
 		}
+		if (!substitutionSignature(oldTool).equals(substitutionSignature(newTool))) {
+			d.fullRerunReason = "a definition the config substitutes with <- changed";
+			return d;
+		}
 		// Actions.
 		final Map<String, List<Action>> oldByKey = new HashMap<>();
 		final Map<Integer, String> oldSig = new HashMap<>();
@@ -329,6 +333,41 @@ public final class Incremental {
 			sb.append("action ").append(signature(c, null)).append('\n');
 		}
 		return sb.toString();
+	}
+
+	/**
+	 * The definitions the config substitutes in ({@code CONSTANT N <- Def},
+	 * {@code Op <- Def}, {@code Op <- [M] Def}). TLC binds them as tool
+	 * objects, so the syntactic walk in {@link #signature} never reaches them:
+	 * an edit to {@code Def} would leave every action's signature unchanged.
+	 */
+	private static String substitutionSignature(final Tool tool) {
+		final Map<String, OpDefNode> byName = new HashMap<>();
+		final OpDefNode[] defs = tool.getSpecProcessor().getRootModule().getOpDefs();
+		for (final OpDefNode def : defs == null ? new OpDefNode[0] : defs) {
+			byName.put(def.getName().toString(), def);
+		}
+		final Map<String, String> subst = new TreeMap<>();
+		final Map<String, String> overrides = tool.getModelConfig().getOverrides();
+		for (final Map.Entry<String, String> e : overrides.entrySet()) {
+			subst.put(e.getKey(), substituted(e.getValue(), byName));
+		}
+		final Map<?, ?> modOverrides = tool.getModelConfig().getModOverrides();
+		for (final Map.Entry<?, ?> m : modOverrides.entrySet()) {
+			for (final Map.Entry<?, ?> e : ((Map<?, ?>) m.getValue()).entrySet()) {
+				subst.put(m.getKey() + "!" + e.getKey(), substituted(String.valueOf(e.getValue()), byName));
+			}
+		}
+		final StringBuilder sb = new StringBuilder();
+		for (final Map.Entry<String, String> e : subst.entrySet()) {
+			sb.append(e.getKey()).append(" <- ").append(e.getValue()).append('\n');
+		}
+		return sb.toString();
+	}
+
+	private static String substituted(final String rhs, final Map<String, OpDefNode> byName) {
+		final OpDefNode def = byName.get(rhs);
+		return def == null || def.getBody() == null ? rhs : rhs + " == " + signature(def.getBody(), null);
 	}
 
 	/** The view and symmetry set: they decide what a fingerprint identifies. */
