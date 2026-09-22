@@ -16,6 +16,8 @@ on:
 jobs:
 
   build:
+    # Upstream-only: publishes signed releases with tlaplus secrets.
+    if: github.repository == 'tlaplus/tlaplus'
     runs-on: ${{ matrix.operating-system }}
     permissions:
       contents: write # Required by git tag (below), which changes the content of the git repository

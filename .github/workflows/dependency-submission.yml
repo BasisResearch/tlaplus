@@ -36,6 +36,8 @@ env:
 
 jobs:
   submit-vendored-jars:
+    # Upstream-only: the fork does not maintain the dependency graph.
+    if: github.repository == 'tlaplus/tlaplus'
     name: Submit vendored JARs
     runs-on: ubuntu-latest
     permissions:

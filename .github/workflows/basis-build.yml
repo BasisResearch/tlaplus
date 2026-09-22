@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: MIT
+#
+# Basis fork build: produce a pinned tla2tools.jar and publish it as a
+# per-commit GitHub release with a sha256 checksum. Mirrors the
+# BasisResearch/cvc5 and BasisResearch/z3 basis-build workflows, so
+# verus-tools-mcp can download the jar unauthenticated and verify it against
+# a hardcoded hash. The jar is platform independent, so there is one asset,
+# not a macOS/Linux pair; the consumer supplies a Java 11+ runtime.
+#
+# Upstream's pr.yml still runs the TLC unit tests on pull requests; this
+# workflow only builds and publishes.
+
+name: basis-build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: basis-build-${{ github.ref }}
+  # Cancel superseded PR builds only: a cancelled master run would leave that
+  # commit without a release.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # customBuild.xml's git-revision target reads the repository with
+          # JGit 2.3; it needs a full, non-partial clone.
+          fetch-depth: 0
+
+      - name: set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: install ant
+        run: sudo apt-get update && sudo apt-get install -y ant
+
+      - name: build tla2tools.jar
+        run: |
+          ant -f tlatools/org.lamport.tlatools/customBuild.xml info compile compile-test dist
+
+      - name: package
+        shell: bash
+        run: |
+          cp tlatools/org.lamport.tlatools/dist/tla2tools.jar tla2tools.jar
+          # Smoke test: a jar that cannot model-check Bakery fails the build
+          # before anything is published.
+          java -cp tla2tools.jar tlc2.TLC -tool -workers 1 \
+            -metadir "$RUNNER_TEMP/tlc-states" \
+            tlatools/org.lamport.tlatools/test-model/pcal/Bakery.tla
+          shasum -a 256 tla2tools.jar > tla2tools.jar.sha256
+          cat tla2tools.jar.sha256
+
+      - name: upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tla2tools
+          path: |
+            tla2tools.jar
+            tla2tools.jar.sha256
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: [build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: download all artifacts
+        uses: actions/download-artifact@v8
+
+      - name: publish per-commit release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="basis-${GITHUB_SHA:0:10}"
+          # The jar is not byte-reproducible (the manifest carries the build
+          # date), so a re-run must not replace a release whose hash
+          # verus-tools-mcp may already pin.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag already exists; keeping it"
+            exit 0
+          fi
+          cat ./*/*.sha256 > SHA256SUMS
+          {
+            printf 'Pinned Basis build of tla2tools.jar at %s.\n\n' "$GITHUB_SHA"
+            printf '%s\n' '```'
+            cat SHA256SUMS
+            printf '%s\n' '```'
+          } > RELEASE_NOTES.md
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Basis TLC build $tag" \
+            --notes-file RELEASE_NOTES.md \
+            tla2tools/tla2tools.jar \
+            tla2tools/tla2tools.jar.sha256 \
+            SHA256SUMS

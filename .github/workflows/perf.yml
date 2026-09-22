@@ -11,6 +11,8 @@ on:
 
 jobs:
   build:
+    # Upstream-only: needs the tlaplus runs-on runners.
+    if: github.repository == 'tlaplus/tlaplus'
     runs-on:
         - runs-on=${{ github.run_id }}
         - family=c7gd.4xlarge
