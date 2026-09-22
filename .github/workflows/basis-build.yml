@@ -20,11 +20,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: basis-build-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded PR builds only: a cancelled master run would leave that
+  # commit without a release.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -54,7 +56,11 @@ jobs:
         shell: bash
         run: |
           cp tlatools/org.lamport.tlatools/dist/tla2tools.jar tla2tools.jar
-          java -cp tla2tools.jar tlc2.TLC -h 2>&1 | head -3 || true
+          # Smoke test: a jar that cannot model-check Bakery fails the build
+          # before anything is published.
+          java -cp tla2tools.jar tlc2.TLC -tool -workers 1 \
+            -metadir "$RUNNER_TEMP/tlc-states" \
+            tlatools/org.lamport.tlatools/test-model/pcal/Bakery.tla
           shasum -a 256 tla2tools.jar > tla2tools.jar.sha256
           cat tla2tools.jar.sha256
 
@@ -71,6 +77,8 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: [build]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: download all artifacts
         uses: actions/download-artifact@v8
@@ -81,6 +89,13 @@ jobs:
         shell: bash
         run: |
           tag="basis-${GITHUB_SHA:0:10}"
+          # The jar is not byte-reproducible (the manifest carries the build
+          # date), so a re-run must not replace a release whose hash
+          # verus-tools-mcp may already pin.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag already exists; keeping it"
+            exit 0
+          fi
           cat ./*/*.sha256 > SHA256SUMS
           {
             printf 'Pinned Basis build of tla2tools.jar at %s.\n\n' "$GITHUB_SHA"
@@ -88,7 +103,6 @@ jobs:
             cat SHA256SUMS
             printf '%s\n' '```'
           } > RELEASE_NOTES.md
-          gh release delete -y "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag 2>/dev/null || true
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Basis TLC build $tag" \
