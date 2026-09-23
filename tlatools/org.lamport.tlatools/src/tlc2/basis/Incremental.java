@@ -63,9 +63,10 @@ import tlc2.util.Vect;
  * {@code p} of an action split out of {@code \E p \in S : A(p)}). Actions are
  * paired with the old ones by name and signature; invariants by name. If the
  * variables, the initial predicate, a state or action constraint, the view or
- * the symmetry set changed, nothing can be reused and the caller runs a fresh
- * exploration instead; so does the caller when the model config changed or
- * the old exploration did not finish.
+ * the symmetry set changed, or anything explored reads {@code TLCGet} (whose
+ * values depend on the path to a state, not the state), nothing can be
+ * reused and the caller runs a fresh exploration instead; so does the caller
+ * when the model config changed or the old exploration did not finish.
  *
  * <p>
  * Otherwise the old store's graph is replayed: the states reachable from the
@@ -174,6 +175,13 @@ public final class Incremental {
 			d.fullRerunReason = "a definition the config substitutes with <- changed";
 			return d;
 		}
+		for (final Tool t : new Tool[] { oldTool, newTool }) {
+			final String reason = tlcGetUse(t);
+			if (reason != null) {
+				d.fullRerunReason = reason;
+				return d;
+			}
+		}
 		// Actions.
 		final Map<String, List<Action>> oldByKey = new HashMap<>();
 		final Map<Integer, String> oldSig = new HashMap<>();
@@ -235,6 +243,50 @@ public final class Incremental {
 			}
 		}
 		return d;
+	}
+
+	/**
+	 * Why a replay cannot be trusted because {@code tool} reads TLC's
+	 * registers, or null. {@code TLCGet("level")} and its siblings depend on
+	 * how a state was reached, not only on its fingerprint: an added action
+	 * can shorten the path to a state and bring successors a level-bounded
+	 * constraint excluded back into the model, which copied edges never
+	 * re-examine. Replay also evaluates without the predecessor TLC sets.
+	 */
+	private static String tlcGetUse(final Tool tool) {
+		for (final Action a : tool.getActions()) {
+			if (reachesTLCGet(a.pred)) {
+				return "the action " + a.getNameOfDefault() + " reads TLCGet, which depends on the path to a state";
+			}
+		}
+		final Vect<Action> init = tool.getInitStateSpec();
+		for (int i = 0; i < init.size(); i++) {
+			if (reachesTLCGet(init.elementAt(i).pred)) {
+				return "the initial predicate reads TLCGet, which depends on the path to a state";
+			}
+		}
+		for (final ExprNode c : tool.getModelConstraints()) {
+			if (reachesTLCGet(c)) {
+				return "a state constraint reads TLCGet, which depends on the path to a state";
+			}
+		}
+		for (final ExprNode c : tool.getActionConstraints()) {
+			if (reachesTLCGet(c)) {
+				return "an action constraint reads TLCGet, which depends on the path to a state";
+			}
+		}
+		for (final Action a : tool.getInvariants()) {
+			if (reachesTLCGet(a.pred)) {
+				return "the invariant " + a.getNameOfDefault() + " reads TLCGet, which depends on the path to a state";
+			}
+		}
+		return null;
+	}
+
+	private static boolean reachesTLCGet(final SemanticNode node) {
+		final Map<String, String> reached = new TreeMap<>();
+		reach(node, reached, new HashSet<>());
+		return reached.containsKey("TLC!TLCGet");
 	}
 
 	/** Claim the first old action of {@code candidates} not yet paired; false when none is left. */

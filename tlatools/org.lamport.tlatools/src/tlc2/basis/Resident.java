@@ -606,6 +606,14 @@ public final class Resident {
 						resultCode = checker.modelCheck();
 					} catch (final Throwable t) {
 						checkerFailure = t;
+					} finally {
+						// A run that ends before any worker starts (an
+						// initial state violates an invariant, init fails to
+						// evaluate) never finishes the queue, so a budget
+						// suspend waiting for the workers would wait forever.
+						// Finishing it wakes that wait; after a run that
+						// reached the workers it is already finished.
+						checker.theStateQueue.finishAll();
 					}
 				}, "tlc-resident-checker");
 				checkerThread.setDaemon(true);
@@ -615,7 +623,9 @@ public final class Resident {
 			}
 			// Wait for the run to end or the budget to run out. The queue's
 			// suspend blocks until every worker has parked, so on return the
-			// counters are quiescent.
+			// counters are quiescent. The initial states are generated before
+			// any worker runs and cannot be paused: a budget that runs out
+			// then takes effect once they are done (or the run has ended).
 			boolean suspended = false;
 			while (checkerThread.isAlive()) {
 				final long now = System.currentTimeMillis();
@@ -935,7 +945,8 @@ public final class Resident {
 	 * Re-parse the spec after an edit and re-explore only what the edit
 	 * reaches (see {@link Incremental}). A change to the variables, the
 	 * initial predicate, a constraint, the view, the symmetry set or the
-	 * config, or a first run that did not finish, leaves nothing to carry:
+	 * config, a spec that reads {@code TLCGet}, or a first run that did not
+	 * finish, leaves nothing to carry:
 	 * the reply asks for a restart and a full run.
 	 *
 	 * <p>
