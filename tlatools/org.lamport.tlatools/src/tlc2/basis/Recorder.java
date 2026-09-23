@@ -74,6 +74,8 @@ public final class Recorder implements IMessagePrinterRecorder {
 	private final java.util.LinkedHashMap<String, Integer> violationCounts = new java.util.LinkedHashMap<>();
 	/** Reports past the per-property trace cap, per property: counted, not kept as messages. */
 	private final java.util.LinkedHashMap<String, Long> untraced = new java.util.LinkedHashMap<>();
+	/** Invariants whose evaluation failed, to the first failure's message. */
+	private final java.util.LinkedHashMap<String, String> evaluationFailures = new java.util.LinkedHashMap<>();
 	private JsonObject finalStats;
 	private int outcome = EC.NO_ERROR;
 	private String outcomeProperty;
@@ -139,11 +141,28 @@ public final class Recorder implements IMessagePrinterRecorder {
 				outcome = code;
 				outcomeProperty = property;
 			}
-			violationCounts.merge(property == null ? "" : property, 1, Integer::sum);
+			if (code == EC.TLC_INVARIANT_EVALUATION_FAILED) {
+				// The invariant did not evaluate: that is no verdict on it, so
+				// it is kept apart from the violations.
+				evaluationFailures.putIfAbsent(property == null ? "" : property,
+						objects != null && objects.length > 1 ? String.valueOf(objects[1]) : "");
+			} else {
+				violationCounts.merge(property == null ? "" : property, 1, Integer::sum);
+			}
 			trace = new Trace();
 			trace.code = code;
 			trace.property = property;
 			traces.add(trace);
+			break;
+		case EC.TLC_BEHAVIOR_UP_TO_THIS_POINT:
+			// The behaviour is printed from its first state on. When TLC prints
+			// it again for the same report (an evaluation error re-run to
+			// rebuild its call stack), the reprint replaces what came before.
+			if (trace != null && !trace.states.isEmpty()) {
+				trace.states.clear();
+				trace.stuttering = false;
+				trace.lassoTo = null;
+			}
 			break;
 		case EC.TLC_STATE_PRINT1:
 			// A single state (an initial-state violation): no ordinal.
@@ -223,6 +242,7 @@ public final class Recorder implements IMessagePrinterRecorder {
 		traces.clear();
 		violationCounts.clear();
 		untraced.clear();
+		evaluationFailures.clear();
 		finalStats = null;
 		outcome = EC.NO_ERROR;
 		outcomeProperty = null;
@@ -251,6 +271,11 @@ public final class Recorder implements IMessagePrinterRecorder {
 	/** Property name to the number of times TLC reported it violated. */
 	public synchronized Map<String, Integer> violationCounts() {
 		return new java.util.LinkedHashMap<>(violationCounts);
+	}
+
+	/** Invariant name to the message of its first failed evaluation. */
+	public synchronized Map<String, String> evaluationFailures() {
+		return new java.util.LinkedHashMap<>(evaluationFailures);
 	}
 
 	/** Property name to the reports past its trace cap, which carry no message or trace. */

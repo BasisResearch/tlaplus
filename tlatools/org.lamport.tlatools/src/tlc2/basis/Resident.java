@@ -712,17 +712,30 @@ public final class Resident {
 	private JsonArray invariantVerdicts(final boolean finished) {
 		final JsonArray out = new JsonArray();
 		final Map<String, Integer> counts = recorder.violationCounts();
+		final Map<String, String> failures = recorder.evaluationFailures();
 		final List<Recorder.Trace> traces = recorder.traces();
 		final boolean exhausted = finished && explorationComplete();
 		for (final String name : tool.getInvNames()) {
 			final JsonObject v = new JsonObject();
 			v.addProperty("name", name);
 			final Integer n = counts.get(name);
-			if (n != null) {
-				v.addProperty("verdict", "violated");
-				v.addProperty("reports", n);
+			final String failure = failures.get(name);
+			if (n != null || failure != null) {
+				if (n != null) {
+					v.addProperty("verdict", "violated");
+					v.addProperty("reports", n);
+				} else {
+					// It did not evaluate on some state: no verdict either way.
+					v.addProperty("verdict", "not_evaluable");
+				}
+				if (failure != null) {
+					v.addProperty("error", failure);
+				}
+				// The first trace of the verdict's own kind.
+				final boolean violation = n != null;
 				for (final Recorder.Trace t : traces) {
-					if (name.equals(t.property)) {
+					if (name.equals(t.property)
+							&& violation == (t.code != EC.TLC_INVARIANT_EVALUATION_FAILED)) {
 						v.addProperty("level", t.states.size());
 						if (!t.states.isEmpty()) {
 							v.add("action", t.states.get(t.states.size() - 1).get("action"));
@@ -784,6 +797,21 @@ public final class Resident {
 		}
 	}
 
+	/** Whether a result code reports a property violated (or a deadlock), not an error. */
+	private static boolean isViolation(final int code) {
+		switch (code) {
+		case EC.TLC_INVARIANT_VIOLATED_INITIAL:
+		case EC.TLC_INVARIANT_VIOLATED_BEHAVIOR:
+		case EC.TLC_INVARIANT_VIOLATED_LEVEL:
+		case EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR:
+		case EC.TLC_TEMPORAL_PROPERTY_VIOLATED:
+		case EC.TLC_DEADLOCK_REACHED:
+			return true;
+		default:
+			return false;
+		}
+	}
+
 	// ─── stats ──────────────────────────────────────────────────────────
 
 	private JsonObject stats() {
@@ -823,14 +851,16 @@ public final class Resident {
 	private JsonObject registers() {
 		final JsonObject r = new JsonObject();
 		final boolean finished = resultCode != null;
-		final boolean queueEmpty = checker.getStateQueueSize() == 0;
+		// The same judgement a refresh relies on: an error (an invariant or
+		// the next-state relation failing to evaluate) ends the run with
+		// states unexplored, continuation or not.
+		final boolean exhausted = finished && explorationComplete();
 		r.addProperty("finished", finished);
-		r.addProperty("exhausted", finished && queueEmpty && checkerFailure == null
-				&& (resultCode == EC.NO_ERROR || runContinuation));
+		r.addProperty("exhausted", exhausted);
 		r.addProperty("stopped_by", checkerFailure != null ? "error"
 				: !finished ? (checkerThread == null ? "not_started" : "budget")
-				: resultCode == EC.NO_ERROR ? "exhausted"
-				: runContinuation ? "exhausted_with_violations" : "violation");
+				: exhausted ? (resultCode == EC.NO_ERROR ? "exhausted" : "exhausted_with_violations")
+				: isViolation(resultCode) ? "violation" : "error");
 		if (finished) {
 			r.addProperty("result_code", resultCode);
 		}
