@@ -1004,7 +1004,15 @@ public final class Resident {
 		reply.addProperty("replayed_from", baseStore == store ? "current" : "last_complete");
 		final String newMetadir = FileUtil.makeMetaDir(new Date(System.currentTimeMillis()), specDir, null);
 		final GraphStore newStore = new GraphStore(newMetadir);
-		final Incremental.Result r = Incremental.replay(newTool, baseStore, newStore, diff, budgetMs, cont);
+		Incremental.Result r;
+		try {
+			r = Incremental.replay(newTool, baseStore, newStore, diff, budgetMs, cont);
+		} catch (final Throwable t) {
+			// Anything the replay did not turn into an error of its own still
+			// leaves the edited spec unadopted, and is cleaned up below.
+			r = new Incremental.Result();
+			r.error = t.toString();
+		}
 		reply.addProperty("survivors", r.survivors);
 		reply.addProperty("dropped", r.dropped);
 		reply.addProperty("reexpanded", r.reexpanded);

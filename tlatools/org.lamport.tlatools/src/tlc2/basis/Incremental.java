@@ -467,24 +467,42 @@ public final class Incremental {
 			if (survivor) {
 				r.survivors++;
 				// Carried edges: copy successors and their content.
-				for (final long[] e : forward.getOrDefault(fp, List.of())) {
-					final long to = e[0];
-					final Action a = newTool.getActions()[actionIndex(newTool, (int) e[1])];
-					final TLCState succ = newStore.contains(to) ? newStore.read(to) : rebind(newTool, oldStore.read(to));
-					if (succ == null) {
-						continue;
+				try {
+					for (final long[] e : forward.getOrDefault(fp, List.of())) {
+						final long to = e[0];
+						final Action a = newTool.getActions()[actionIndex(newTool, (int) e[1])];
+						final TLCState succ = newStore.contains(to) ? newStore.read(to)
+								: rebind(newTool, oldStore.read(to));
+						if (succ == null) {
+							continue;
+						}
+						final boolean unseen = !newStore.contains(to);
+						newStore.writeState(state, succ,
+								unseen ? tlc2.util.IStateWriter.IsUnseen : tlc2.util.IStateWriter.IsSeen, a);
+						r.edgesCopied++;
+						if (seen.add(to)) {
+							queue.add(to);
+						}
 					}
-					final boolean unseen = !newStore.contains(to);
-					newStore.writeState(state, succ, unseen ? tlc2.util.IStateWriter.IsUnseen : tlc2.util.IStateWriter.IsSeen, a);
-					r.edgesCopied++;
-					if (seen.add(to)) {
-						queue.add(to);
-					}
+				} catch (final Throwable t) {
+					r.error = "copying edges: " + t;
+					break;
 				}
 				// Changed invariants on a survivor.
 				for (int k = 0; k < invariants.length; k++) {
 					final String name = k < invNames.length ? invNames[k] : invariants[k].getNameOfDefault();
-					if (changedInv.contains(name) && !newTool.isValid(invariants[k], state)) {
+					if (!changedInv.contains(name)) {
+						continue;
+					}
+					boolean holds;
+					try {
+						holds = newTool.isValid(invariants[k], state);
+					} catch (final Throwable t) {
+						r.error = name + ": " + t;
+						stop = true;
+						break;
+					}
+					if (!holds) {
 						r.violations.add(new Violation(name, fp, newStore.level(fp)));
 						if (!continueOnViolation) {
 							stop = true;

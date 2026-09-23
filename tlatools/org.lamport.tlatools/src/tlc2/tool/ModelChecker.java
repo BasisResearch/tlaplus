@@ -1067,12 +1067,26 @@ public class ModelChecker extends AbstractChecker
 	private boolean held = false;
 	/** True while the periodic work has the workers parked. */
 	private boolean periodicParked = false;
+	/**
+	 * Held by whoever waits in {@code theStateQueue.suspendAll()}. The queue
+	 * wakes a single waiter when the last worker parks, so a second thread
+	 * waiting there at the same time (the periodic work and a caller of
+	 * {@link #suspend()}) would never be woken. Not the checker's monitor:
+	 * workers take that on their way to the barrier.
+	 */
+	private final Object suspendLock = new Object();
+
+	private boolean suspendQueue() {
+		synchronized (this.suspendLock) {
+			return this.theStateQueue.suspendAll();
+		}
+	}
 
 	private boolean periodicSuspend() {
 		synchronized (this) {
 			this.periodicParked = true;
 		}
-		final boolean suspended = this.theStateQueue.suspendAll();
+		final boolean suspended = this.suspendQueue();
 		if (!suspended) {
 			synchronized (this) {
 				this.periodicParked = false;
@@ -1097,7 +1111,7 @@ public class ModelChecker extends AbstractChecker
 		// Basis: wait for the workers outside this monitor. A worker reporting
 		// a violation (or the end of the run) takes it before it can reach the
 		// queue's barrier, so waiting while holding it deadlocks.
-		this.theStateQueue.suspendAll();
+		this.suspendQueue();
 		synchronized (this) {
 			this.notifyAll();
 		}
