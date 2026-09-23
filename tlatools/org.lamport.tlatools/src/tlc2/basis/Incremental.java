@@ -683,11 +683,23 @@ public final class Incremental {
 	 * successor generation.
 	 */
 	public static List<Sweep> sweep(final Tool tool, final GraphStore store) {
+		return sweep(tool, store, null);
+	}
+
+	/**
+	 * {@link #sweep(Tool, GraphStore)} over the invariants named in
+	 * {@code only} (every invariant when null); one {@link Sweep} per
+	 * configured invariant, in order, with those left out untouched.
+	 */
+	public static List<Sweep> sweep(final Tool tool, final GraphStore store, final Set<String> only) {
 		final Action[] invariants = tool.getInvariants();
 		final String[] names = tool.getInvNames();
 		final List<Sweep> out = new ArrayList<>();
+		final boolean[] wanted = new boolean[invariants.length];
 		for (int k = 0; k < invariants.length; k++) {
-			out.add(new Sweep(k < names.length ? names[k] : invariants[k].getNameOfDefault()));
+			final String name = k < names.length ? names[k] : invariants[k].getNameOfDefault();
+			out.add(new Sweep(name));
+			wanted[k] = only == null || only.contains(name);
 		}
 		for (final long fp : store.fingerprints()) {
 			final TLCState state = rebind(tool, store.read(fp));
@@ -697,7 +709,7 @@ public final class Incremental {
 			final Integer level = store.level(fp);
 			for (int k = 0; k < invariants.length; k++) {
 				final Sweep sw = out.get(k);
-				if (sw.error != null) {
+				if (!wanted[k] || sw.error != null) {
 					continue;
 				}
 				try {

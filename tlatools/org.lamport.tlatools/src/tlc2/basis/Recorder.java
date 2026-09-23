@@ -131,6 +131,7 @@ public final class Recorder implements IMessagePrinterRecorder {
 		case EC.TLC_INVARIANT_VIOLATED_LEVEL:
 		case EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR:
 		case EC.TLC_TEMPORAL_PROPERTY_VIOLATED:
+		case EC.TLC_PROPERTY_VIOLATED_INITIAL:
 		case EC.TLC_DEADLOCK_REACHED:
 		case EC.TLC_INVARIANT_EVALUATION_FAILED:
 			final String property = objects != null && objects.length > 0 && !(objects[0] instanceof TLCState)

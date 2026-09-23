@@ -715,6 +715,28 @@ public final class Resident {
 		final Map<String, String> failures = recorder.evaluationFailures();
 		final List<Recorder.Trace> traces = recorder.traces();
 		final boolean exhausted = finished && explorationComplete();
+		// Under continuation TLC reports the first invariant a state violates
+		// and checks no further invariant on that state. An invariant never
+		// reported may then fail only on states an earlier one failed on, so
+		// its silence is no verdict: it is evaluated over the stored graph.
+		final java.util.Set<String> unreported = new java.util.LinkedHashSet<>();
+		boolean anyViolated = false;
+		for (final String name : tool.getInvNames()) {
+			if (counts.containsKey(name)) {
+				anyViolated = true;
+			} else if (!failures.containsKey(name)) {
+				unreported.add(name);
+			}
+		}
+		final boolean skipped = exhausted && runContinuation && anyViolated && !unreported.isEmpty();
+		final Map<String, Incremental.Sweep> swept = new HashMap<>();
+		if (skipped && store != null) {
+			for (final Incremental.Sweep sw : Incremental.sweep(tool, store, unreported)) {
+				if (unreported.contains(sw.invariant)) {
+					swept.put(sw.invariant, sw);
+				}
+			}
+		}
 		for (final String name : tool.getInvNames()) {
 			final JsonObject v = new JsonObject();
 			v.addProperty("name", name);
@@ -743,6 +765,25 @@ public final class Resident {
 						break;
 					}
 				}
+			} else if (skipped) {
+				final Incremental.Sweep sw = swept.get(name);
+				if (sw == null) {
+					v.addProperty("verdict", "not_evaluated");
+					v.addProperty("reason",
+							"under continuation TLC checks no further invariant on a state that violates one, and without a store the skipped states cannot be revisited");
+				} else if (sw.error != null) {
+					v.addProperty("verdict", "not_evaluable");
+					v.addProperty("error", sw.error);
+				} else if (sw.violations > 0) {
+					// Found over the store, not reported by TLC: no trace.
+					v.addProperty("verdict", "violated");
+					v.addProperty("reports", sw.violations);
+					v.addProperty("level", sw.firstLevel);
+					v.addProperty("fp", sw.firstFp);
+					v.addProperty("source", "store");
+				} else {
+					v.addProperty("verdict", "no_violation_found");
+				}
 			} else {
 				v.addProperty("verdict", exhausted ? "no_violation_found" : "not_evaluated");
 			}
@@ -761,6 +802,9 @@ public final class Resident {
 			return "action_property_violated";
 		case EC.TLC_TEMPORAL_PROPERTY_VIOLATED:
 			return "temporal_property_violated";
+		case EC.TLC_PROPERTY_VIOLATED_INITIAL:
+			// A PROPERTY that is false in an initial state.
+			return "property_violated";
 		case EC.TLC_DEADLOCK_REACHED:
 			return "deadlock";
 		case EC.TLC_INVARIANT_EVALUATION_FAILED:
@@ -805,6 +849,7 @@ public final class Resident {
 		case EC.TLC_INVARIANT_VIOLATED_LEVEL:
 		case EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR:
 		case EC.TLC_TEMPORAL_PROPERTY_VIOLATED:
+		case EC.TLC_PROPERTY_VIOLATED_INITIAL:
 		case EC.TLC_DEADLOCK_REACHED:
 			return true;
 		default:
@@ -859,7 +904,10 @@ public final class Resident {
 		r.addProperty("exhausted", exhausted);
 		r.addProperty("stopped_by", checkerFailure != null ? "error"
 				: !finished ? (checkerThread == null ? "not_started" : "budget")
-				: exhausted ? (resultCode == EC.NO_ERROR ? "exhausted" : "exhausted_with_violations")
+				// Under continuation a run that reported violations still ends
+				// on NO_ERROR, so the recorder, not the code, says if it found any.
+				: exhausted ? (resultCode == EC.NO_ERROR && recorder.violationCounts().isEmpty() ? "exhausted"
+						: "exhausted_with_violations")
 				: isViolation(resultCode) ? "violation" : "error");
 		if (finished) {
 			r.addProperty("result_code", resultCode);
