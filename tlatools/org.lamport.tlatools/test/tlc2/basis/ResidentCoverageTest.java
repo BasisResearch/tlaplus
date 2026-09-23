@@ -36,22 +36,27 @@ import com.google.gson.JsonObject;
 /**
  * Coverage as data: a conjunct no evaluation reached is listed under
  * {@code unevaluated}, a primed conjunct (an assignment) is not, and an
- * action whose guards all ran lists nothing.
+ * action whose guards all ran lists nothing. After an incremental refresh
+ * the coverage is still the run's, marked stale, not an empty tree.
  */
 public class ResidentCoverageTest {
+
+	private static String spec(final int dLimit) {
+		return "---- MODULE V ----\n" //
+				+ "EXTENDS Naturals\n" //
+				+ "VARIABLES x\n" //
+				+ "Init == x = 0\n" //
+				+ "A == x < 3 /\\ x' = x + 1\n" //
+				+ "D == x > " + dLimit + " /\\ x * 2 > 25 /\\ x' = 0\n" //
+				+ "Next == A \\/ D\n" //
+				+ "====\n";
+	}
 
 	@Test
 	public void testUnevaluated() throws Exception {
 		final ResidentHarness h = new ResidentHarness();
 		h.write("V.cfg", "INIT Init\nNEXT Next\n");
-		h.write("V.tla", "---- MODULE V ----\n" //
-				+ "EXTENDS Naturals\n" //
-				+ "VARIABLES x\n" //
-				+ "Init == x = 0\n" //
-				+ "A == x < 3 /\\ x' = x + 1\n" //
-				+ "D == x > 10 /\\ x * 2 > 25 /\\ x' = 0\n" //
-				+ "Next == A \\/ D\n" //
-				+ "====\n");
+		h.write("V.tla", spec(10));
 		h.ok("{\"command\":\"open\",\"spec\":\"" + h.spec("V") + "\",\"workers\":1,\"deadlock\":false}");
 		h.ok("{\"command\":\"check\"}");
 		final JsonObject coverage = h.ok("{\"command\":\"coverage\"}").getAsJsonObject("coverage");
@@ -66,6 +71,15 @@ public class ResidentCoverageTest {
 		assertEquals(1, actions.get("D").getAsJsonArray("unevaluated").size());
 		assertEquals("x*2>25", actions.get("D").getAsJsonArray("unevaluated").get(0).getAsJsonObject()
 				.get("text").getAsString());
+		assertTrue(h.ok("{\"command\":\"coverage\"}").get("stale") == null);
+
+		// A refresh replaces the tool with one no checker ran; coverage stays
+		// the run's, and says it is stale.
+		h.write("V.tla", spec(11));
+		assertEquals("incremental", h.ok("{\"command\":\"refresh\"}").get("mode").getAsString());
+		final JsonObject after = h.ok("{\"command\":\"coverage\"}");
+		assertTrue(after.toString(), after.get("stale").getAsBoolean());
+		assertEquals(after.toString(), 2, after.getAsJsonObject("coverage").getAsJsonArray("actions").size());
 		h.resident.shutdown();
 	}
 }

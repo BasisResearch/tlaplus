@@ -41,15 +41,14 @@ import tlc2.tool.liveness.ModelCheckerTestCase;
 import tlc2.util.IStateWriter;
 
 /**
- * The store on a real run: every reached state, every edge, and a tally for
- * every guard that evaluated false, including equality and membership guards
- * on unprimed variables, which TLC evaluates before any primed variable is
- * assigned.
+ * A successor a state constraint excludes is tallied as a constraint row, not
+ * as a guard of the action that generated it, and is counted apart from the
+ * false guards.
  */
-public class GraphStoreGuardTest extends ModelCheckerTestCase {
+public class GraphStoreConstraintTest extends ModelCheckerTestCase {
 
-	public GraphStoreGuardTest() {
-		super("Guards", "basis", new String[] { "-deadlock" }, ExitStatus.SUCCESS);
+	public GraphStoreConstraintTest() {
+		super("GuardsConstraint", "basis", new String[] { "-deadlock" }, ExitStatus.SUCCESS);
 	}
 
 	private GraphStore store;
@@ -84,39 +83,26 @@ public class GraphStoreGuardTest extends ModelCheckerTestCase {
 	public void testSpec() {
 		assertTrue(recorder.recorded(EC.TLC_FINISHED));
 		assertFalse(recorder.recorded(EC.GENERAL));
-		assertTrue(recorder.recordedWithStringValues(EC.TLC_STATS, "5", "4", "0"));
 
-		// (0,a) -A-> (1,b) -B-> (2,c); (0,a) -C-> (0,c) -C-> (0,c).
-		assertEquals(4, store.states());
-		assertEquals(1, store.initialStates());
-		assertEquals(4, store.edges());
+		// 0 -A-> 1 -A-> 2; A's step from 2 to 3 is excluded by Small.
+		assertEquals(3, store.states());
+		assertEquals(2, store.edges());
 
-		final Map<String, Long> counts = new HashMap<>();
+		final Map<String, GraphStore.Blocked> rows = new HashMap<>();
 		for (final GraphStore.Blocked b : store.blocked()) {
-			assertEquals("guard", b.kind);
-			counts.put(b.action + ": " + b.text, b.count);
+			rows.put(b.kind + " " + b.action, b);
 		}
-		// A's guard fails at (1,b), (0,c), (2,c); B's at (0,a), (0,c), (2,c);
-		// C's at (1,b), (2,c).
-		assertEquals(Long.valueOf(3), counts.get("A: pc=\"a\""));
-		assertEquals(Long.valueOf(3), counts.get("B: pc=\"b\""));
-		assertEquals(Long.valueOf(2), counts.get("C: x<1"));
-		assertEquals(3, counts.size());
-		assertEquals(8, store.unsatisfied());
-		assertEquals(0, store.excluded());
-
-		// Every stored state reads back, and the deepest one's path is the
-		// three-state behaviour through A and B.
-		long deepest = 0;
-		for (final long fp : store.fingerprints()) {
-			assertNotNull(store.read(fp));
-			if (store.level(fp) == 3) {
-				deepest = fp;
-			}
-		}
-		final long[][] path = store.pathTo(deepest);
-		assertEquals(3, path.length);
-		assertEquals("A", store.action((int) path[1][1]).getNameOfDefault());
-		assertEquals("B", store.action((int) path[2][1]).getNameOfDefault());
+		assertEquals(rows.toString(), 2, rows.size());
+		// B's guard fails at 0, 1 and 2.
+		final GraphStore.Blocked guard = rows.get("guard B");
+		assertNotNull(rows.keySet().toString(), guard);
+		assertEquals("x=10", guard.text);
+		assertEquals(3, guard.count);
+		// The constraint dropped one successor A generated.
+		final GraphStore.Blocked constraint = rows.get("constraint A");
+		assertNotNull(rows.keySet().toString(), constraint);
+		assertEquals(1, constraint.count);
+		assertEquals(3, store.unsatisfied());
+		assertEquals(1, store.excluded());
 	}
 }

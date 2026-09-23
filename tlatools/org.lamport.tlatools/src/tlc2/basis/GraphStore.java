@@ -31,6 +31,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
 
 import tla2sany.parser.SyntaxTreeNode;
 import tla2sany.semantic.SemanticNode;
@@ -63,7 +65,11 @@ import tlc2.value.ValueOutputStream;
  * the way {@code DiskStateQueue} serialises states; the index (fingerprint
  * to offset, level and first predecessor) and the predecessor lists stay in
  * memory. Blocked guards are tallied, not logged: per (action, conjunct)
- * a count, one example state and one example binding.
+ * a count, one example state and one example binding. The tallies take no
+ * lock (a false guard is reported far more often than an edge); edges and
+ * states are recorded under the store's lock, which costs a run with many
+ * edges per state noticeable time (about 1.4x on a spec with 3.4M edges,
+ * one worker or four).
  *
  * <p>
  * The in-memory part is not bounded: roughly a hundred bytes of heap per
@@ -92,21 +98,65 @@ public final class GraphStore implements IStateWriter {
 		}
 	}
 
-	/** One guard conjunct's tally of the transitions it disabled. */
+	/** One guard conjunct's (or constraint's) tally of the transitions it disabled. */
 	public static final class Blocked {
 		public final int actionId;
 		public final String action;
+		/** {@code guard}: a conjunct of the action evaluated false; {@code constraint}: a state or action constraint excluded the successor. */
+		public final String kind;
 		public final String location;
 		public final String text;
+		/** The count when this row was read ({@link GraphStore#blocked()} returns snapshots). */
 		public long count;
 		public long exampleFp;
 		public Map<String, String> exampleBindings;
+		private final LongAdder tally = new LongAdder();
 
-		Blocked(int actionId, String action, String location, String text) {
+		Blocked(int actionId, String action, String kind, String location, String text) {
 			this.actionId = actionId;
 			this.action = action;
+			this.kind = kind;
 			this.location = location;
 			this.text = text;
+		}
+
+		private Blocked snapshot() {
+			final Blocked b = new Blocked(actionId, action, kind, location, text);
+			b.count = tally.sum();
+			b.exampleFp = exampleFp;
+			b.exampleBindings = exampleBindings;
+			return b;
+		}
+	}
+
+	/**
+	 * What a tally is kept per: the action, the conjunct's node (by identity:
+	 * it is the same node on every evaluation, so no text or location is
+	 * built on the hot path) and whether it is a guard or a constraint.
+	 */
+	private static final class TallyKey {
+		final int actionId;
+		final SemanticNode pred;
+		final boolean constraint;
+
+		TallyKey(int actionId, SemanticNode pred, boolean constraint) {
+			this.actionId = actionId;
+			this.pred = pred;
+			this.constraint = constraint;
+		}
+
+		@Override
+		public boolean equals(final Object o) {
+			if (!(o instanceof TallyKey)) {
+				return false;
+			}
+			final TallyKey k = (TallyKey) o;
+			return actionId == k.actionId && pred == k.pred && constraint == k.constraint;
+		}
+
+		@Override
+		public int hashCode() {
+			return 31 * (31 * actionId + System.identityHashCode(pred)) + (constraint ? 1 : 0);
 		}
 	}
 
@@ -116,10 +166,15 @@ public final class GraphStore implements IStateWriter {
 	/** Fingerprint to (predecessor fp, action id, flags) triples. */
 	private final Map<Long, LongVec> predecessors = new HashMap<>();
 	private final Map<Integer, Action> actions = new HashMap<>();
-	private final Map<String, Blocked> blocked = new HashMap<>();
+	/**
+	 * Tallied without the store's lock: every worker reports every false
+	 * guard, many times more often than it reports an edge.
+	 */
+	private final ConcurrentHashMap<TallyKey, Blocked> blocked = new ConcurrentHashMap<>();
 	private final List<Long> initial = new ArrayList<>();
 	private long edges;
-	private long unsatisfied;
+	private final LongAdder unsatisfied = new LongAdder();
+	private final LongAdder excluded = new LongAdder();
 	private TLCState empty;
 	/** Serialised states not yet written to {@link #content}; flushed before a read. */
 	private final ByteArrayOutputStream pending = new ByteArrayOutputStream(1 << 16);
@@ -194,10 +249,16 @@ public final class GraphStore implements IStateWriter {
 		}
 	}
 
+	/**
+	 * A state or action constraint {@code pred} excluded {@code successor}:
+	 * the worker calls this only for constraints. Tallied apart from the
+	 * guards, since the successor was generated and then dropped.
+	 */
 	@Override
-	public synchronized void writeState(final TLCState state, final TLCState successor, final short stateFlags,
+	public void writeState(final TLCState state, final TLCState successor, final short stateFlags,
 			final Action action, final SemanticNode pred) {
-		writeUnsatisfied(state, action, successor, pred, null);
+		excluded.increment();
+		tally(state, action, pred, null, true);
 	}
 
 	/**
@@ -205,28 +266,39 @@ public final class GraphStore implements IStateWriter {
 	 * enabled at {@code state} because of {@code pred}, under the quantifier
 	 * bindings in {@code c}. Tallied per (action, conjunct).
 	 */
-	public synchronized void writeUnsatisfied(final TLCState state, final Action action, final TLCState successor,
+	@Override
+	public void writeUnsatisfied(final TLCState state, final Action action, final TLCState successor,
 			final SemanticNode pred, final Context c) {
-		unsatisfied++;
+		unsatisfied.increment();
+		tally(state, action, pred, c, false);
+	}
+
+	private void tally(final TLCState state, final Action action, final SemanticNode pred, final Context c,
+			final boolean constraint) {
 		final int actionId = action == null ? -1 : action.getId();
-		final String location = pred == null ? "?" : String.valueOf(pred.getLocation());
-		final String key = actionId + "|" + location;
+		final TallyKey key = new TallyKey(actionId, pred, constraint);
 		Blocked b = blocked.get(key);
 		if (b == null) {
-			b = new Blocked(actionId, action == null ? "?" : action.getNameOfDefault(), location, text(pred));
-			try {
-				b.exampleFp = state.fingerPrint();
-			} catch (final RuntimeException e) {
-				b.exampleFp = 0;
-			}
-			if (c != null) {
-				final Map<String, String> bindings = new HashMap<>();
-				c.toMap().forEach((k, v) -> bindings.put(k.toString(), v.toString()));
-				b.exampleBindings = bindings;
-			}
-			blocked.put(key, b);
+			// The row's text, location and example are built once, by
+			// whichever worker reports the conjunct first.
+			b = blocked.computeIfAbsent(key, k -> {
+				final Blocked n = new Blocked(actionId, action == null ? "?" : action.getNameOfDefault(),
+						constraint ? "constraint" : "guard", pred == null ? "?" : String.valueOf(pred.getLocation()),
+						text(pred));
+				try {
+					n.exampleFp = state.fingerPrint();
+				} catch (final RuntimeException e) {
+					n.exampleFp = 0;
+				}
+				if (c != null) {
+					final Map<String, String> bindings = new HashMap<>();
+					c.toMap().forEach((name, v) -> bindings.put(name.toString(), v.toString()));
+					n.exampleBindings = bindings;
+				}
+				return n;
+			});
 		}
-		b.count++;
+		b.tally.increment();
 	}
 
 	/** The source text of a semantic node, or its location when the parse tree is gone. */
@@ -489,8 +561,12 @@ public final class GraphStore implements IStateWriter {
 		return actions.get(id);
 	}
 
-	public synchronized List<Blocked> blocked() {
-		final List<Blocked> out = new ArrayList<>(blocked.values());
+	/** Snapshots of the tallies, guards and constraints alike. */
+	public List<Blocked> blocked() {
+		final List<Blocked> out = new ArrayList<>();
+		for (final Blocked b : blocked.values()) {
+			out.add(b.snapshot());
+		}
 		out.sort((a, b) -> Long.compare(b.count, a.count));
 		return out;
 	}
@@ -523,8 +599,14 @@ public final class GraphStore implements IStateWriter {
 		return edges;
 	}
 
-	public synchronized long unsatisfied() {
-		return unsatisfied;
+	/** Guard conjuncts that evaluated false. */
+	public long unsatisfied() {
+		return unsatisfied.sum();
+	}
+
+	/** Successors a state or action constraint excluded. */
+	public long excluded() {
+		return excluded.sum();
 	}
 
 	public synchronized long initialStates() {

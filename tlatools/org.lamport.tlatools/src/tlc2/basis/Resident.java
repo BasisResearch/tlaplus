@@ -80,7 +80,8 @@ import util.ToolIO;
  * {@code metadir} where TLC keeps its state files, {@code deadlock} (default
  * true) whether deadlocks are violations, {@code store} (default true)
  * whether to keep the {@link GraphStore} the store queries and refresh
- * need (it costs heap per state and edge).</li>
+ * need (it costs heap per state and edge, and time: every edge is
+ * recorded under one lock).</li>
  * <li>{@code check}: explore, resuming where the last check stopped, until
  * the reachable graph is exhausted, a violation is found, or the budget runs
  * out: {@code budget_ms} of wall time, {@code budget_states} distinct
@@ -99,6 +100,12 @@ public final class Resident {
 
 	private final Recorder recorder = new Recorder();
 	private Tool tool;
+	/**
+	 * The tool the checker (or simulator) ran: its cost model holds the
+	 * coverage counters. A refresh replaces {@link #tool} with one no checker
+	 * ran, so coverage is read from this one.
+	 */
+	private Tool runTool;
 	private GraphStore store;
 	private ModelChecker checker;
 	/** True after an incremental refresh: the store is current, the checker is not. */
@@ -241,11 +248,16 @@ public final class Resident {
 		case "simulate":
 			return simulate(request);
 		case "coverage": {
-			if (tool == null) {
+			if (runTool == null) {
 				return notOpen();
 			}
 			final JsonObject reply = ok();
-			reply.add("coverage", tlc2.tool.coverage.CoverageWalk.walk(tool));
+			reply.add("coverage", tlc2.tool.coverage.CoverageWalk.walk(runTool));
+			if (refreshed) {
+				reply.addProperty("stale", true);
+				reply.addProperty("stale_reason",
+						"the store was refreshed incrementally; coverage is the last full run's, over the spec as it was then");
+			}
 			return reply;
 		}
 		case "registers": {
@@ -328,6 +340,7 @@ public final class Resident {
 			metadir = FileUtil.makeMetaDir(new Date(openedAt), specDir, null);
 			tool = new FastTool(mainFile, config, new SimpleFilenameToStream(specDir), Tool.Mode.MC,
 					new HashMap<>());
+			runTool = tool;
 			final boolean checkDeadlock = deadlock && tool.getModelConfig().getCheckDeadlock();
 			this.checkDeadlock = checkDeadlock;
 			configText = readConfig();
@@ -339,6 +352,7 @@ public final class Resident {
 			TLCGlobals.mainChecker = checker;
 		} catch (final Throwable t) {
 			tool = null;
+			runTool = null;
 			checker = null;
 			final JsonObject reply = error(null, "open_failed", t.toString());
 			reply.add("messages", recorder.drainMessages());
@@ -386,6 +400,7 @@ public final class Resident {
 			metadir = FileUtil.makeMetaDir(new Date(openedAt), specDir, null);
 			tool = new FastTool(mainFile, config, new SimpleFilenameToStream(specDir), Tool.Mode.Simulation,
 					new HashMap<>());
+			runTool = tool;
 			// A non-null traceActions sizes the per-worker action-pair counters;
 			// anything but BASIC/FULL keeps TLC from writing its dot files.
 			simulator = new tlc2.tool.Simulator(tool, metadir, null, deadlock, depth, traces, "STATS", rng, seed,
@@ -393,6 +408,7 @@ public final class Resident {
 			TLCGlobals.simulator = simulator;
 		} catch (final Throwable t) {
 			tool = null;
+			runTool = null;
 			simulator = null;
 			final JsonObject reply = error(null, "open_failed", t.toString());
 			reply.add("messages", recorder.drainMessages());
@@ -884,6 +900,7 @@ public final class Resident {
 		o.addProperty("initial", store.initialStates());
 		o.addProperty("edges", store.edges());
 		o.addProperty("unsatisfied", store.unsatisfied());
+		o.addProperty("excluded", store.excluded());
 		o.addProperty("bytes", store.bytes());
 		return o;
 	}
@@ -1442,6 +1459,7 @@ public final class Resident {
 			final JsonObject o = new JsonObject();
 			o.addProperty("action", b.action);
 			o.addProperty("action_id", b.actionId);
+			o.addProperty("kind", b.kind);
 			o.addProperty("location", b.location);
 			o.addProperty("text", b.text);
 			o.addProperty("count", b.count);
@@ -1454,11 +1472,13 @@ public final class Resident {
 			rows.add(o);
 		}
 		reply.addProperty("unsatisfied", store.unsatisfied());
+		reply.addProperty("excluded", store.excluded());
 		reply.add("blocked", rows);
 		reply.addProperty("note",
-				"count is how often the subexpression evaluated false while TLC generated the action's successors, "
+				"a guard row counts how often the subexpression evaluated false while TLC generated the action's successors, "
 						+ "attributed to the first false conjunct in TLC's evaluation order. Under a disjunction each "
-						+ "false disjunct is counted, even when another disjunct let the action fire");
+						+ "false disjunct is counted, even when another disjunct let the action fire. A constraint row "
+						+ "counts successors the action generated that a state or action constraint then excluded");
 		if (refreshed) {
 			reply.addProperty("stale", true);
 			reply.addProperty("stale_reason",

@@ -181,23 +181,31 @@ public final class Incremental {
 			oldByKey.computeIfAbsent(a.getNameOfDefault(), k -> new ArrayList<>()).add(a);
 			oldSig.put(a.getId(), signature(a));
 		}
+		// Exact (name, signature) pairs first, over every new action, so an
+		// edited action cannot claim an old one that a later new action
+		// matches exactly: the disjuncts of an unnamed Next all share its
+		// name, and inserting one in front would otherwise shift every pair.
 		final Set<Integer> matchedOld = new HashSet<>();
-		for (final Action n : newTool.getActions()) {
-			final String name = n.getNameOfDefault();
-			final String sig = signature(n);
-			final List<Action> candidates = oldByKey.getOrDefault(name, List.of());
-			Action match = null;
-			for (final Action o : candidates) {
+		final Action[] newActions = newTool.getActions();
+		final Action[] exact = new Action[newActions.length];
+		for (int i = 0; i < newActions.length; i++) {
+			final String sig = signature(newActions[i]);
+			for (final Action o : oldByKey.getOrDefault(newActions[i].getNameOfDefault(), List.of())) {
 				if (!matchedOld.contains(o.getId()) && oldSig.get(o.getId()).equals(sig)) {
-					match = o;
+					matchedOld.add(o.getId());
+					exact[i] = o;
 					break;
 				}
 			}
-			if (match != null) {
-				matchedOld.add(match.getId());
-				d.carried.put(match.getId(), n);
+		}
+		// Then the rest: a same-named old action left over makes it changed.
+		for (int i = 0; i < newActions.length; i++) {
+			final Action n = newActions[i];
+			final String name = n.getNameOfDefault();
+			if (exact[i] != null) {
+				d.carried.put(exact[i].getId(), n);
 				d.unchanged.add(name);
-			} else if (pairUnmatched(candidates, matchedOld)) {
+			} else if (pairUnmatched(oldByKey.getOrDefault(name, List.of()), matchedOld)) {
 				// Same name, different signature.
 				d.changed.add(name);
 				d.reexpand.add(n);
