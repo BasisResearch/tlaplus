@@ -898,6 +898,18 @@ public abstract class Tool
 	  return getNextStates(action, action.con, state);
   }
   
+  /**
+   * Basis: {@link #getNextStates(Action, TLCState)} without counting the
+   * evaluation in the action's coverage, for queries made outside a run
+   * (the resident's successor queries) that must not change its report.
+   */
+  public final StateVec getNextStatesUnrecorded(final Action action, final TLCState state) {
+    final StateVec nss = new StateVec(0);
+    this.getNextStates(action, action.pred, ActionItemList.Empty, action.con, state,
+        TLCState.Empty.createEmpty().setPredecessor(state).setAction(action), nss, CostModel.DO_NOT_RECORD);
+    return nss;
+  }
+
   public final StateVec getNextStates(final Action action, final Context ctx, final TLCState state) {
     ActionItemList acts = ActionItemList.Empty;
     TLCState s1 = TLCState.Empty.createEmpty();

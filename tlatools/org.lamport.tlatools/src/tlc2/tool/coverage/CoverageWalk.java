@@ -190,8 +190,9 @@ public final class CoverageWalk {
 
 	/**
 	 * The subexpressions under {@code root} whose own evaluation count is
-	 * zero and that are not primed (a primed node is assigned, not
-	 * evaluated), listed flat with their locations.
+	 * zero and below which nothing ran, assignments included, listed flat
+	 * with their locations. The inside of an assignment is not listed: its
+	 * primed side is a target, never evaluated.
 	 */
 	private static JsonArray unevaluated(final CostModelNode root) {
 		final JsonArray out = new JsonArray();
@@ -212,7 +213,9 @@ public final class CoverageWalk {
 				// conjuncts run (the printer collapses such nodes into their
 				// children), so a node is unevaluated only when nothing below
 				// it ran either.
-				if (w.getEvalCount(Calculate.FRESH) == 0L && !w.isPrimed() && !anyEvaluated(w)) {
+				// An assignment (x' = e, marked primed) counts when it runs, so
+				// one whose count is zero with nothing below it run is dead too.
+				if (w.getEvalCount(Calculate.FRESH) == 0L && !anyEvaluated(w)) {
 					final JsonObject o = new JsonObject();
 					o.addProperty("location", w.getLocation().toString());
 					if (w.getNode() != null) {
@@ -231,7 +234,7 @@ public final class CoverageWalk {
 		for (final CostModelNode child : node.children.values()) {
 			if (child instanceof OpApplNodeWrapper) {
 				final OpApplNodeWrapper w = (OpApplNodeWrapper) child;
-				if (w.getEvalCount(Calculate.FRESH) > 0L || w.isPrimed()) {
+				if (w.getEvalCount(Calculate.FRESH) > 0L) {
 					return true;
 				}
 			} else if (child.getEvalCount() > 0L) {

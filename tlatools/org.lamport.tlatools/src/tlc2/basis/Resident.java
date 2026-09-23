@@ -123,7 +123,8 @@ public final class Resident {
 	private boolean storing = true;
 	/**
 	 * Set when a refresh that did not replace the tool left TLC's static
-	 * tables unfit for the parked checker to resume: why a restart is needed.
+	 * tables unfit for the old spec: why a restart is needed. Every request
+	 * that evaluates against the spec is refused from then on.
 	 */
 	private String restartRequired;
 	/** The model config's text when the store was built, to detect edits. */
@@ -223,6 +224,22 @@ public final class Resident {
 	}
 
 	private JsonObject dispatch(final String command, final JsonObject request) throws Exception {
+		switch (command) {
+		case "check":
+		case "trace":
+		case "neighbours":
+		case "eval":
+		case "screen":
+		case "refresh": {
+			final JsonObject refusal = restartRefusal();
+			if (refusal != null) {
+				return refusal;
+			}
+			break;
+		}
+		default:
+			break;
+		}
 		switch (command) {
 		case "open":
 			return open(request);
@@ -568,10 +585,6 @@ public final class Resident {
 		if (refreshed) {
 			return error(null, "refreshed",
 					"this session was refreshed incrementally: its store is current and the store queries serve it, but TLC's own checker is not; open a new session for a full run");
-		}
-		if (restartRequired != null && resultCode == null && checkerFailure == null) {
-			return error(null, "restart_required",
-					"the paused run cannot resume in this process: " + restartRequired + "; open a new session");
 		}
 		final long budgetMs = request.has("budget_ms") ? request.get("budget_ms").getAsLong() : Long.MAX_VALUE;
 		final long budgetStates = request.has("budget_states") ? request.get("budget_states").getAsLong()
@@ -989,6 +1002,7 @@ public final class Resident {
 		o.addProperty("edges", store.edges());
 		o.addProperty("unsatisfied", store.unsatisfied());
 		o.addProperty("excluded", store.excluded());
+		o.addProperty("excluded_states", store.excludedStates());
 		o.addProperty("bytes", store.bytes());
 		return o;
 	}
@@ -1070,6 +1084,9 @@ public final class Resident {
 			baseTool = tool;
 			baseStore = store;
 		}
+		// Parsing rebinds the process-global name slots; kept to put them back
+		// if the edited spec is not adopted.
+		final Map<util.UniqueString, Integer> slots = nameSlots();
 		final Tool newTool;
 		try {
 			newTool = new FastTool(mainFile, configName, new SimpleFilenameToStream(specDir), Tool.Mode.MC,
@@ -1078,7 +1095,7 @@ public final class Resident {
 			final JsonObject reply = error(null, "parse_failed", t.toString());
 			reply.add("messages", recorder.drainMessages());
 			// The current tool and store stay in place.
-			rebindStatics(tool);
+			rebindStatics(tool, slots);
 			return reply;
 		}
 		final Incremental.ActionDiff diff = Incremental.diff(baseTool, newTool);
@@ -1086,7 +1103,7 @@ public final class Resident {
 		reply.add("diff", Incremental.diffJson(diff));
 		reply.addProperty("front_end_ms", System.currentTimeMillis() - started);
 		if (diff.fullRerunReason != null) {
-			rebindStatics(tool);
+			rebindStatics(tool, slots);
 			return fullRerun(reply, diff.fullRerunReason, started);
 		}
 		reply.addProperty("mode", "incremental");
@@ -1112,7 +1129,7 @@ public final class Resident {
 		if (r.error != null) {
 			// The edited spec does not evaluate; keep serving what was there.
 			newStore.dispose();
-			rebindStatics(tool);
+			rebindStatics(tool, slots);
 			reply.addProperty("adopted", false);
 			reply.addProperty("finished", false);
 			reply.addProperty("complete", false);
@@ -1268,11 +1285,20 @@ public final class Resident {
 	 * Rebind TLC's static variable tables to {@code old} after parsing a spec
 	 * that was not adopted. Parsing assigns each variable name its slot and
 	 * sets the variable count, the empty state and the state's tool; this
-	 * puts the old spec's back. A name that was a definition of the old spec
-	 * and a variable of the new one has lost its definition slot, which
-	 * cannot be put back: the parked run then must not resume.
+	 * puts the old spec's back, and every name's slot as {@code slots}
+	 * recorded it before the parse (a definition of the old spec that the
+	 * new one declares a variable would otherwise evaluate as that
+	 * variable). Should a definition still read as a variable, nothing that
+	 * evaluates against the spec is served any more.
 	 */
-	private void rebindStatics(final Tool old) {
+	private void rebindStatics(final Tool old, final Map<util.UniqueString, Integer> slots) {
+		// Every name's slot as it was before the parse: a definition of the
+		// old spec that the edited one declares a variable gets its definition
+		// slot back. A name first seen in the parse gets none.
+		for (final util.UniqueString u : util.UniqueString.internTbl.toMap().values()) {
+			final Integer loc = slots.get(u);
+			u.setLoc(loc == null ? -1 : loc);
+		}
 		final tla2sany.semantic.OpDeclNode[] vars = old.getSpecProcessor().getVariablesNodes();
 		for (int i = 0; i < vars.length; i++) {
 			vars[i].getName().setLoc(i);
@@ -1287,6 +1313,28 @@ public final class Resident {
 				return;
 			}
 		}
+	}
+
+	/** Every interned name's slot in a state or the definition table (-1 for none). */
+	private static Map<util.UniqueString, Integer> nameSlots() {
+		final Map<util.UniqueString, Integer> out = new java.util.IdentityHashMap<>();
+		for (final util.UniqueString u : util.UniqueString.internTbl.toMap().values()) {
+			// A slot is either a variable's or a definition's.
+			out.put(u, Math.max(u.getVarLoc(), u.getDefnLoc()));
+		}
+		return out;
+	}
+
+	/**
+	 * The refusal every request that evaluates against the spec gives once a
+	 * refresh left TLC's statics unfit for it, or null.
+	 */
+	private JsonObject restartRefusal() {
+		if (restartRequired == null) {
+			return null;
+		}
+		return error(null, "restart_required",
+				"this session cannot evaluate against its spec any more: " + restartRequired + "; open a new session");
 	}
 
 	/** The path from an initial state to a stored fingerprint. */
@@ -1353,7 +1401,8 @@ public final class Resident {
 			o.addProperty("action", a.getNameOfDefault());
 			o.addProperty("action_id", a.getId());
 			try {
-				final StateVec next = tool.getNextStates(a, state);
+				// Not counted in the run's coverage: this query is not part of the run.
+				final StateVec next = tool.getNextStatesUnrecorded(a, state);
 				o.addProperty("enabled", next.size() > 0);
 				o.addProperty("successors", next.size());
 				if (next.size() > 0) {

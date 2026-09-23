@@ -30,6 +30,7 @@ import java.util.Map;
 
 import org.junit.Test;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
@@ -68,10 +69,23 @@ public class ResidentCoverageTest {
 		assertEquals(3, actions.get("A").get("found").getAsLong());
 		assertEquals(0, actions.get("A").getAsJsonArray("unevaluated").size());
 		assertEquals(0, actions.get("D").get("found").getAsLong());
-		assertEquals(1, actions.get("D").getAsJsonArray("unevaluated").size());
-		assertEquals("x*2>25", actions.get("D").getAsJsonArray("unevaluated").get(0).getAsJsonObject()
-				.get("text").getAsString());
+		// Past D's first guard nothing ran: the second guard, and the
+		// assignment, whose only evaluated part would be its primed side.
+		final JsonArray dead = actions.get("D").getAsJsonArray("unevaluated");
+		assertEquals(dead.toString(), 2, dead.size());
+		assertEquals("x*2>25", dead.get(0).getAsJsonObject().get("text").getAsString());
+		assertEquals("x'=0", dead.get(1).getAsJsonObject().get("text").getAsString());
 		assertTrue(h.ok("{\"command\":\"coverage\"}").get("stale") == null);
+
+		// Queries over the store evaluate outside the run and leave its
+		// coverage as it was.
+		final String fp = h.ok("{\"command\":\"screen\",\"candidates\":[\"x # 1\"]}").getAsJsonArray("results")
+				.get(0).getAsJsonObject().get("first_violation_fp").getAsString();
+		for (int i = 0; i < 3; i++) {
+			h.ok("{\"command\":\"neighbours\",\"fp\":\"" + fp + "\"}");
+			h.ok("{\"command\":\"eval\",\"fp\":\"" + fp + "\",\"expr\":\"x + 1\"}");
+		}
+		assertEquals(coverage.toString(), h.ok("{\"command\":\"coverage\"}").getAsJsonObject("coverage").toString());
 
 		// A refresh replaces the tool with one no checker ran; coverage stays
 		// the run's, and says it is stale.

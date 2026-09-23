@@ -75,6 +75,9 @@ import tlc2.util.Vect;
  * changed and added actions only; states reached for the first time are
  * expanded under every action. Every new state is checked against every
  * invariant, and every surviving state against the changed invariants.
+ * Successors a constraint excludes are checked too, as TLC checks them, and
+ * kept in the store unexpanded; edges to them under unchanged actions are
+ * carried like any other.
  * Successor generation, constraints and invariant evaluation all go through
  * the new {@link Tool}, so the store is a cache of TLC's own answers, never
  * an oracle of its own. Copying an edge is sound only because the old store
@@ -541,26 +544,36 @@ public final class Incremental {
 					break;
 				}
 				// Changed invariants on a survivor.
-				for (int k = 0; k < invariants.length; k++) {
-					final String name = k < invNames.length ? invNames[k] : invariants[k].getNameOfDefault();
-					if (!changedInv.contains(name)) {
-						continue;
-					}
-					boolean holds;
-					try {
-						holds = newTool.isValid(invariants[k], state);
-					} catch (final Throwable t) {
-						r.error = name + ": " + t;
-						stop = true;
-						break;
-					}
-					if (!holds) {
-						r.violations.add(new Violation(name, fp, newStore.level(fp)));
-						if (!continueOnViolation) {
+				if (checkInvariants(newTool, state, fp, newStore.level(fp), invariants, invNames, changedInv,
+						continueOnViolation, r)) {
+					break;
+				}
+				// Carried edges to excluded successors: the same successors under
+				// the same constraints, so still excluded. TLC checked every
+				// invariant on them; the changed ones are checked again.
+				try {
+					for (final long[] e : oldStore.excludedSuccessors(fp)) {
+						final Action a = diff.carried.get((int) e[1]);
+						if (a == null) {
+							continue;
+						}
+						final long to = e[0];
+						final boolean fresh = !newStore.contains(to) && !newStore.isExcluded(to);
+						final TLCState succ = fresh ? rebind(newTool, oldStore.read(to)) : newStore.read(to);
+						if (succ == null) {
+							continue;
+						}
+						newStore.writeExcluded(state, succ, a);
+						r.edgesCopied++;
+						if (fresh && checkInvariants(newTool, succ, to, newStore.level(to), invariants, invNames,
+								changedInv, continueOnViolation, r)) {
 							stop = true;
 							break;
 						}
 					}
+				} catch (final Throwable t) {
+					r.error = "copying excluded edges: " + t;
+					break;
 				}
 				if (stop) {
 					break;
@@ -605,14 +618,19 @@ public final class Incremental {
 		return out;
 	}
 
-	/** Expand one state under {@code actions}; returns true to stop. */
+	/**
+	 * Expand one state under {@code actions}; returns true to stop. As TLC's
+	 * worker does, every invariant is checked on a successor seen for the
+	 * first time, including one a constraint excludes from the model: the
+	 * excluded one is kept in the store, not expanded.
+	 */
 	private static boolean expand(final Tool tool, final GraphStore store, final TLCState state, final long fp,
 			final List<Action> actions, final Action[] invariants, final String[] invNames,
 			final boolean continueOnViolation, final Set<Long> seen, final ArrayDeque<Long> queue, final Result r) {
 		for (final Action a : actions) {
 			final StateVec next;
 			try {
-				next = tool.getNextStates(a, state);
+				next = tool.getNextStatesUnrecorded(a, state);
 			} catch (final Throwable t) {
 				r.error = a.getNameOfDefault() + ": " + t;
 				return true;
@@ -625,35 +643,27 @@ public final class Incremental {
 				}
 				boolean inModel;
 				try {
-					inModel = tool.isInModel(succ) && tool.isInActions(state, succ);
+					inModel = inModel(tool, state, succ);
 				} catch (final Throwable t) {
 					r.error = "constraint: " + t;
 					return true;
 				}
+				final long to = succ.fingerPrint();
 				if (!inModel) {
+					final boolean fresh = !store.contains(to) && !store.isExcluded(to);
+					store.writeExcluded(state, succ, a);
+					if (fresh && checkInvariants(tool, succ, to, store.level(to), invariants, invNames, null,
+							continueOnViolation, r)) {
+						return true;
+					}
 					continue;
 				}
-				final long to = succ.fingerPrint();
 				final boolean unseen = !store.contains(to);
 				store.writeState(state, succ, unseen ? tlc2.util.IStateWriter.IsUnseen : tlc2.util.IStateWriter.IsSeen, a);
 				r.edgesGenerated++;
-				if (unseen) {
-					for (int k = 0; k < invariants.length; k++) {
-						boolean holds;
-						try {
-							holds = tool.isValid(invariants[k], succ);
-						} catch (final Throwable t) {
-							r.error = (k < invNames.length ? invNames[k] : "invariant") + ": " + t;
-							return true;
-						}
-						if (!holds) {
-							r.violations.add(new Violation(k < invNames.length ? invNames[k] : invariants[k].getNameOfDefault(),
-									to, store.level(to)));
-							if (!continueOnViolation) {
-								return true;
-							}
-						}
-					}
+				if (unseen && checkInvariants(tool, succ, to, store.level(to), invariants, invNames, null,
+						continueOnViolation, r)) {
+					return true;
 				}
 				if (seen.add(to)) {
 					queue.add(to);
@@ -661,6 +671,79 @@ public final class Incremental {
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * Whether {@code succ}, reached from {@code state}, satisfies every state
+	 * and action constraint, as {@link Tool#isInModel(TLCState)} and
+	 * {@link Tool#isInActions(TLCState, TLCState)} decide it. Those read the
+	 * constraints' cost models, which only a tool a checker ran has, so a
+	 * refreshed tool evaluates them without one.
+	 */
+	private static boolean inModel(final Tool tool, final TLCState state, final TLCState succ) {
+		for (final ExprNode c : tool.getModelConstraints()) {
+			if (!bool(tool.eval(c, Context.Empty, succ, tlc2.tool.coverage.CostModel.DO_NOT_RECORD), c)) {
+				return false;
+			}
+		}
+		for (final ExprNode c : tool.getActionConstraints()) {
+			if (!bool(tool.eval(c, Context.Empty, state, succ, tlc2.tool.EvalControl.Clear,
+					tlc2.tool.coverage.CostModel.DO_NOT_RECORD), c)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private static boolean bool(final tlc2.value.IValue v, final ExprNode constraint) {
+		if (!(v instanceof tlc2.value.impl.BoolValue)) {
+			throw new IllegalStateException("constraint " + GraphStore.text(constraint) + " is not a boolean: " + v);
+		}
+		return ((tlc2.value.impl.BoolValue) v).val;
+	}
+
+	/**
+	 * Check the invariants named in {@code only} (every one when null) on
+	 * {@code state}, recording violations; returns true to stop, on an error
+	 * or on a violation unless {@code continueOnViolation}.
+	 */
+	private static boolean checkInvariants(final Tool tool, final TLCState state, final long fp, final Integer level,
+			final Action[] invariants, final String[] invNames, final Set<String> only,
+			final boolean continueOnViolation, final Result r) {
+		for (int k = 0; k < invariants.length; k++) {
+			final String name = k < invNames.length ? invNames[k] : invariants[k].getNameOfDefault();
+			if (only != null && !only.contains(name)) {
+				continue;
+			}
+			boolean holds;
+			try {
+				holds = holds(tool, invariants[k], state);
+			} catch (final Throwable t) {
+				r.error = name + ": " + t;
+				return true;
+			}
+			if (!holds) {
+				r.violations.add(new Violation(name, fp, level == null ? -1 : level));
+				if (!continueOnViolation) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Whether the state predicate {@code inv} holds in {@code state}, as
+	 * {@link Tool#isValid(Action, TLCState)} decides it but without counting
+	 * the evaluation in the invariant's coverage: a sweep over the store is
+	 * not part of the run whose coverage is reported.
+	 */
+	static boolean holds(final Tool tool, final Action inv, final TLCState state) {
+		final tlc2.value.IValue v = tool.eval(inv.pred, inv.con, state, tlc2.tool.coverage.CostModel.DO_NOT_RECORD);
+		if (!(v instanceof tlc2.value.impl.BoolValue)) {
+			throw new IllegalStateException("invariant " + inv.getNameOfDefault() + " is not a boolean: " + v);
+		}
+		return ((tlc2.value.impl.BoolValue) v).val;
 	}
 
 	/** One invariant's verdict over a whole store. */
@@ -677,7 +760,8 @@ public final class Incremental {
 	}
 
 	/**
-	 * Evaluate every invariant on every stored state: exact per-invariant
+	 * Evaluate every invariant on every stored state, excluded successors
+	 * included, as TLC evaluates them: exact per-invariant
 	 * verdicts for the refreshed graph, the first violation being the one at
 	 * the lowest level. Costs one evaluation per (state, invariant), no
 	 * successor generation.
@@ -701,7 +785,12 @@ public final class Incremental {
 			out.add(new Sweep(name));
 			wanted[k] = only == null || only.contains(name);
 		}
-		for (final long fp : store.fingerprints()) {
+		// The excluded successors too: TLC checks invariants on them.
+		final long[] inModel = store.fingerprints();
+		final long[] excluded = store.excludedFingerprints();
+		final long[] all = java.util.Arrays.copyOf(inModel, inModel.length + excluded.length);
+		System.arraycopy(excluded, 0, all, inModel.length, excluded.length);
+		for (final long fp : all) {
 			final TLCState state = rebind(tool, store.read(fp));
 			if (state == null) {
 				continue;
@@ -713,7 +802,7 @@ public final class Incremental {
 					continue;
 				}
 				try {
-					if (!tool.isValid(invariants[k], state)) {
+					if (!holds(tool, invariants[k], state)) {
 						sw.violations++;
 						if (sw.firstLevel == null || (level != null && level < sw.firstLevel)) {
 							sw.firstLevel = level;

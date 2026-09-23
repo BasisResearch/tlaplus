@@ -64,7 +64,9 @@ import tlc2.value.ValueOutputStream;
  * State content goes to one append-only file under the metadir, serialised
  * the way {@code DiskStateQueue} serialises states; the index (fingerprint
  * to offset, level and first predecessor) and the predecessor lists stay in
- * memory. Blocked guards are tallied, not logged: per (action, conjunct)
+ * memory. Successors a constraint excluded are kept as well, content and
+ * edge, since TLC checks invariants on them and an invariant sweep must too.
+ * Blocked guards are tallied, not logged: per (action, conjunct)
  * a count, one example state and one example binding. The tallies take no
  * lock (a false guard is reported far more often than an edge); edges and
  * states are recorded under the store's lock, which costs a run with many
@@ -163,6 +165,14 @@ public final class GraphStore implements IStateWriter {
 	private final File file;
 	private final RandomAccessFile content;
 	private final Map<Long, Entry> index = new HashMap<>();
+	/**
+	 * Successors a state or action constraint excluded, by fingerprint: they
+	 * are not in the model and never expanded, but TLC checks every invariant
+	 * on them, so their content is kept for the invariant sweeps.
+	 */
+	private final Map<Long, Entry> excludedIndex = new HashMap<>();
+	/** Fingerprint to (excluded successor fp, action id) pairs, each edge once. */
+	private final Map<Long, LongVec> excludedEdges = new HashMap<>();
 	/** Fingerprint to (predecessor fp, action id, flags) triples. */
 	private final Map<Long, LongVec> predecessors = new HashMap<>();
 	private final Map<Integer, Action> actions = new HashMap<>();
@@ -259,6 +269,56 @@ public final class GraphStore implements IStateWriter {
 			final Action action, final SemanticNode pred) {
 		excluded.increment();
 		tally(state, action, pred, null, true);
+		writeExcluded(state, successor, action);
+	}
+
+	/**
+	 * Keep {@code successor}, which a constraint excluded when {@code action}
+	 * generated it from {@code state}: its content (once per fingerprint) and
+	 * the edge (once per source and action). The worker reports an excluded
+	 * successor once per constraint it fails; the repeats add nothing.
+	 */
+	public void writeExcluded(final TLCState state, final TLCState successor, final Action action) {
+		final long from = state.fingerPrint();
+		final long to = successor.fingerPrint();
+		final int actionId = action == null ? -1 : action.getId();
+		final boolean known;
+		synchronized (this) {
+			known = excludedIndex.containsKey(to);
+			if (known && hasExcludedEdge(from, to, actionId)) {
+				return;
+			}
+		}
+		final byte[] data = known ? null : serialise(successor);
+		synchronized (this) {
+			if (action != null) {
+				actions.putIfAbsent(actionId, action);
+			}
+			if (data != null && !excludedIndex.containsKey(to)) {
+				final Entry pred = index.get(from);
+				excludedIndex.put(to, new Entry(append(data), data.length, pred == null ? 2 : pred.level + 1, from,
+						actionId));
+			}
+			if (!hasExcludedEdge(from, to, actionId)) {
+				final LongVec edges = excludedEdges.computeIfAbsent(from, k -> new LongVec(2));
+				edges.addElement(to);
+				edges.addElement(actionId);
+			}
+		}
+	}
+
+	/** Caller holds the lock. */
+	private boolean hasExcludedEdge(final long from, final long to, final int actionId) {
+		final LongVec edges = excludedEdges.get(from);
+		if (edges == null) {
+			return false;
+		}
+		for (int i = 0; i < edges.size(); i += 2) {
+			if (edges.elementAt(i) == to && edges.elementAt(i + 1) == actionId) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**
@@ -441,10 +501,14 @@ public final class GraphStore implements IStateWriter {
 	/** Append serialised content; the file write is batched. Caller holds the lock. */
 	private void store(final long fp, final byte[] data, final int level, final long predecessor,
 			final int action) {
+		index.put(fp, new Entry(append(data), data.length, level, predecessor, action));
+	}
+
+	/** Append serialised content and return its offset. Caller holds the lock. */
+	private long append(final byte[] data) {
 		final long offset = length;
 		pending.write(data, 0, data.length);
 		length += data.length;
-		index.put(fp, new Entry(offset, data.length, level, predecessor, action));
 		if (pending.size() >= FLUSH_AT) {
 			try {
 				flush();
@@ -452,6 +516,13 @@ public final class GraphStore implements IStateWriter {
 				throw new RuntimeException("basis.states: " + e.getMessage(), e);
 			}
 		}
+		return offset;
+	}
+
+	/** A state in the model, else an excluded successor, else null. Caller holds the lock. */
+	private Entry entry(final long fp) {
+		final Entry e = index.get(fp);
+		return e != null ? e : excludedIndex.get(fp);
 	}
 
 	private void flush() throws IOException {
@@ -473,9 +544,9 @@ public final class GraphStore implements IStateWriter {
 		pending.reset();
 	}
 
-	/** The stored state with this fingerprint, or null. */
+	/** The stored state (in the model, or an excluded successor) with this fingerprint, or null. */
 	public synchronized TLCState read(final long fp) {
-		final Entry e = index.get(fp);
+		final Entry e = entry(fp);
 		if (e == null) {
 			return null;
 		}
@@ -501,7 +572,7 @@ public final class GraphStore implements IStateWriter {
 	}
 
 	public synchronized Integer level(final long fp) {
-		final Entry e = index.get(fp);
+		final Entry e = entry(fp);
 		return e == null ? null : e.level;
 	}
 
@@ -521,13 +592,14 @@ public final class GraphStore implements IStateWriter {
 	 * state). Null when {@code fp} is not stored.
 	 */
 	public synchronized long[][] pathTo(final long fp) {
-		if (!index.containsKey(fp)) {
+		if (entry(fp) == null) {
 			return null;
 		}
 		final List<long[]> reversed = new ArrayList<>();
 		long cur = fp;
 		while (true) {
-			final Entry e = index.get(cur);
+			// An excluded successor ends a path; every state before it is in the model.
+			final Entry e = cur == fp ? entry(cur) : index.get(cur);
 			if (e == null) {
 				break;
 			}
@@ -542,6 +614,44 @@ public final class GraphStore implements IStateWriter {
 			path[i] = reversed.get(path.length - 1 - i);
 		}
 		return path;
+	}
+
+	/** Whether {@code fp} was kept as an excluded successor (it may also be in the model). */
+	public synchronized boolean isExcluded(final long fp) {
+		return excludedIndex.containsKey(fp);
+	}
+
+	/** The excluded successors not also in the model: TLC checked invariants on them, and never expanded them. */
+	public synchronized long[] excludedFingerprints() {
+		final List<Long> out = new ArrayList<>();
+		for (final Long fp : excludedIndex.keySet()) {
+			if (!index.containsKey(fp)) {
+				out.add(fp);
+			}
+		}
+		final long[] a = new long[out.size()];
+		for (int i = 0; i < a.length; i++) {
+			a[i] = out.get(i);
+		}
+		return a;
+	}
+
+	/** (excluded successor fp, action id) pairs generated from {@code fp}. */
+	public synchronized long[][] excludedSuccessors(final long fp) {
+		final LongVec v = excludedEdges.get(fp);
+		if (v == null) {
+			return new long[0][];
+		}
+		final long[][] out = new long[v.size() / 2][];
+		for (int i = 0; i < out.length; i++) {
+			out[i] = new long[] { v.elementAt(2 * i), v.elementAt(2 * i + 1) };
+		}
+		return out;
+	}
+
+	/** Excluded successors kept, whether or not they are also in the model. */
+	public synchronized long excludedStates() {
+		return excludedIndex.size();
 	}
 
 	/** (predecessor fp, action id, flags) triples recorded into {@code fp}. */
