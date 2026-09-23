@@ -508,11 +508,19 @@ public final class Resident {
 		reply.addProperty("finished", finished);
 		reply.addProperty("stopped_by_budget", stopped);
 		final int outcome = recorder.outcome();
+		final Integer code = simulatorResult;
+		if (finished && code != null) {
+			reply.addProperty("result_code", code);
+		}
 		if (simulatorFailure != null) {
 			reply.addProperty("verdict", "error");
 			reply.addProperty("error", simulatorFailure.toString());
 		} else if (outcome != EC.NO_ERROR) {
 			reply.addProperty("verdict", verdict(EC.GENERAL, outcome));
+		} else if (finished && !simulationStoppedByBudget && code != null && code != EC.NO_ERROR) {
+			// The simulator ended on an error no violation code reports (the
+			// next-state relation failing to evaluate): an error, not a clean run.
+			reply.addProperty("verdict", "error");
 		} else {
 			reply.addProperty("verdict", "no_violation_found");
 		}
@@ -522,6 +530,12 @@ public final class Resident {
 		}
 		// No store in simulation: an initial state's violation keeps TLC's text.
 		recorder.completeInitial(null);
+		// The last complete behaviour TLC printed, as `check` reports it:
+		// an evaluation error's behaviour opens no violation trace.
+		final Recorder.Trace trace = recorder.trace();
+		if (trace != null) {
+			reply.add("trace", traceJson(trace));
+		}
 		final JsonArray all = new JsonArray();
 		for (final Recorder.Trace t : recorder.traces()) {
 			all.add(traceJson(t));
