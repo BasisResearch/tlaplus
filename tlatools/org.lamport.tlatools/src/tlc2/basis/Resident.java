@@ -150,6 +150,13 @@ public final class Resident {
 	 * set that after the run ended.
 	 */
 	private boolean runContinuation;
+	/**
+	 * Whether any part of the run explored past violations. Once it has, TLC
+	 * checked no further invariant on the states that violated one, so an
+	 * invariant it never reported may still fail there, even if a later call
+	 * resumed the run without continuation.
+	 */
+	private boolean everContinued;
 	private String metadir;
 	private volatile Integer resultCode;
 	private volatile Throwable checkerFailure;
@@ -613,6 +620,7 @@ public final class Resident {
 				TLCGlobals.continuation = request.get("continue").getAsBoolean();
 			}
 			runContinuation = TLCGlobals.continuation;
+			everContinued |= runContinuation;
 			if (checkerThread == null) {
 				checkerThread = new Thread(() -> {
 					try {
@@ -741,7 +749,9 @@ public final class Resident {
 				unreported.add(name);
 			}
 		}
-		final boolean skipped = exhausted && runContinuation && anyViolated && !unreported.isEmpty();
+		// Any part of the run under continuation, not only its last call: a
+		// run resumed without it keeps the states it already skipped past.
+		final boolean skipped = exhausted && everContinued && anyViolated && !unreported.isEmpty();
 		final Map<String, Incremental.Sweep> swept = new HashMap<>();
 		if (skipped && store != null) {
 			for (final Incremental.Sweep sw : Incremental.sweep(tool, store, unreported)) {
