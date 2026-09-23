@@ -463,8 +463,11 @@ public final class GraphStore implements IStateWriter {
 	private static byte[] serialise(final TLCState state) {
 		final Serialiser ser = SERIALISER.get();
 		try {
-			ser.bytes.reset();
+			// The stream first: resetting it flushes what it still buffers,
+			// which after a write that threw part way is a partial value that
+			// must not land in front of this state.
 			ser.vos.reset();
+			ser.bytes.reset();
 			for (final tla2sany.semantic.OpDeclNode var : state.getVars()) {
 				final tlc2.value.IValue value = state.lookup(var.getName());
 				if (value == null) {

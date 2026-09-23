@@ -550,6 +550,8 @@ public final class Resident {
 		c.add("actions", actions);
 		c.add("invariants", names(tool.getInvNames()));
 		c.add("implied_actions", names(tool.getImpliedActNames()));
+		// State-level PROPERTY formulas: checked on the initial states only.
+		c.add("implied_inits", names(tool.getImpliedInitNames()));
 		final JsonArray temporals = new JsonArray();
 		for (final Action a : tool.getTemporals()) {
 			temporals.add(a.getNameOfDefault());
@@ -1056,7 +1058,9 @@ public final class Resident {
 	 * not necessarily the current store: a refresh cut short by its budget or
 	 * a first violation is served to the store queries but not replayed from.
 	 * A replay that fails (the edited spec does not evaluate) is not adopted:
-	 * the current tool and store stay.
+	 * the current tool and store stay. Neither is one whose assumptions fail:
+	 * TLC would not explore it. State-level {@code PROPERTY} formulas are
+	 * checked on the initial states, as TLC checks them.
 	 *
 	 * <p>
 	 * A paused checker is left parked, not stopped: stopping ends its run as
@@ -1117,6 +1121,26 @@ public final class Resident {
 			return fullRerun(reply, diff.fullRerunReason, started);
 		}
 		reply.addProperty("mode", "incremental");
+		// TLC checks the assumptions before it explores anything; an edited
+		// ASSUME is checked here too, since the constants it constrains are
+		// the config's and a refresh never runs the checker's own check.
+		final int assumptions = newTool.checkAssumptions();
+		if (assumptions != EC.NO_ERROR) {
+			rebindStatics(tool, slots);
+			reply.addProperty("adopted", false);
+			reply.addProperty("finished", false);
+			reply.addProperty("complete", false);
+			reply.addProperty("verdict",
+					assumptions == EC.TLC_ASSUMPTION_FALSE ? "assumption_false" : "assumption_evaluation_failed");
+			reply.addProperty("error", assumptions == EC.TLC_ASSUMPTION_FALSE
+					? "an assumption of the edited spec is false; the messages name it"
+					: "an assumption of the edited spec did not evaluate; the messages say why");
+			reply.addProperty("duration_ms", System.currentTimeMillis() - started);
+			reply.add("store", storeInfo());
+			reply.add("messages", recorder.drainMessages());
+			return reply;
+		}
+		reply.addProperty("assumptions", "hold");
 		reply.addProperty("replayed_from", baseStore == store ? "current" : "last_complete");
 		final String newMetadir = FileUtil.makeMetaDir(new Date(System.currentTimeMillis()), specDir, null);
 		final GraphStore newStore = new GraphStore(newMetadir);
@@ -1230,6 +1254,26 @@ public final class Resident {
 			reply.add("violations", violations);
 		}
 		reply.add("invariants", invs);
+		// State-level PROPERTY formulas, which TLC checks on the initial
+		// states only. The initial predicate is unchanged, so every initial
+		// state is in the refreshed store, whatever stopped the replay.
+		final JsonArray props = new JsonArray();
+		for (final Incremental.Sweep sw : Incremental.impliedInits(tool, store)) {
+			final JsonObject v = new JsonObject();
+			v.addProperty("name", sw.invariant);
+			if (sw.error != null) {
+				v.addProperty("verdict", "not_evaluable");
+				v.addProperty("error", sw.error);
+			} else if (sw.violations > 0) {
+				v.addProperty("verdict", "violated_initially");
+				v.addProperty("reports", sw.violations);
+				v.addProperty("fp", sw.firstFp);
+			} else {
+				v.addProperty("verdict", "no_violation_found");
+			}
+			props.add(v);
+		}
+		reply.add("implied_inits", props);
 		reply.add("unchecked", unchecked());
 		reply.addProperty("duration_ms", System.currentTimeMillis() - started);
 		reply.add("store", storeInfo());
@@ -1239,7 +1283,8 @@ public final class Resident {
 
 	/**
 	 * What a refresh does not recheck, so a caller does not read the
-	 * invariant verdicts as the whole answer: temporal properties (the
+	 * invariant verdicts as the whole answer (it does check the assumptions
+	 * and the state-level properties, under {@code implied_inits}): temporal properties (the
 	 * liveness tableau is not rebuilt), implied actions, deadlock, and the
 	 * blocked-guard tallies (not recorded during a replay).
 	 */

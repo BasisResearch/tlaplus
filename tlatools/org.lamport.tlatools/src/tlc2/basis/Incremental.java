@@ -482,6 +482,7 @@ public final class Incremental {
 		final Action[] invariants = newTool.getInvariants();
 		final String[] invNames = newTool.getInvNames();
 		final Set<String> changedInv = new HashSet<>(diff.changedInvariants);
+		final boolean viewed = newTool.getViewSpec() != null;
 		// Forward adjacency of the old graph restricted to carried actions:
 		// fp -> (succ fp, new action) pairs.
 		final Map<Long, List<long[]>> forward = new HashMap<>();
@@ -518,7 +519,12 @@ public final class Incremental {
 			}
 			final long fp = queue.poll();
 			final TLCState state = rebind(newTool, newStore.read(fp));
-			final boolean survivor = oldStates.contains(fp);
+			// Under a VIEW a fingerprint names several concrete states, and the
+			// edited spec may reach this one first through another (a changed
+			// or added action). Its old edges were generated from the old
+			// content, so it survives only if the content is the same.
+			final boolean survivor = oldStates.contains(fp)
+					&& (!viewed || sameValues(state, oldStore.read(fp)));
 			if (survivor) {
 				r.survivors++;
 				// Carried edges: copy successors and their content.
@@ -601,6 +607,21 @@ public final class Incremental {
 			}
 		}
 		throw new IllegalStateException("no action with id " + id);
+	}
+
+	/** Whether two states bind every variable to equal values. */
+	private static boolean sameValues(final TLCState a, final TLCState b) {
+		if (a == null || b == null) {
+			return false;
+		}
+		for (final tla2sany.semantic.OpDeclNode v : a.getVars()) {
+			final tlc2.value.IValue va = a.lookup(v.getName());
+			final tlc2.value.IValue vb = b.lookup(v.getName());
+			if (va == null ? vb != null : vb == null || !va.equals(vb)) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	/** A stored state rebuilt against the new spec's variable set. */
@@ -807,6 +828,44 @@ public final class Incremental {
 						if (sw.firstLevel == null || (level != null && level < sw.firstLevel)) {
 							sw.firstLevel = level;
 							sw.firstFp = fp;
+						}
+					}
+				} catch (final Throwable t) {
+					sw.error = t.getMessage() == null ? t.toString() : t.getMessage();
+				}
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * Evaluate every state-level PROPERTY (TLC's implied inits, which it
+	 * checks on the initial states only) on the stored initial states: one
+	 * {@link Sweep} per implied init, in order.
+	 */
+	public static List<Sweep> impliedInits(final Tool tool, final GraphStore store) {
+		final Action[] inits = tool.getImpliedInits();
+		final String[] names = tool.getImpliedInitNames();
+		final List<Sweep> out = new ArrayList<>();
+		for (int k = 0; k < inits.length; k++) {
+			out.add(new Sweep(k < names.length ? names[k] : inits[k].getNameOfDefault()));
+		}
+		for (final long fp : store.initialFingerprints()) {
+			final TLCState state = rebind(tool, store.read(fp));
+			if (state == null) {
+				continue;
+			}
+			for (int k = 0; k < inits.length; k++) {
+				final Sweep sw = out.get(k);
+				if (sw.error != null) {
+					continue;
+				}
+				try {
+					if (!holds(tool, inits[k], state)) {
+						sw.violations++;
+						if (sw.firstFp == null) {
+							sw.firstFp = fp;
+							sw.firstLevel = 1;
 						}
 					}
 				} catch (final Throwable t) {
