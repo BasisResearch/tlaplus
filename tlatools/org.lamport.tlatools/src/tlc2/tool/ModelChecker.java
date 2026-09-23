@@ -1093,7 +1093,12 @@ public class ModelChecker extends AbstractChecker
 	public void suspend() {
 		synchronized (this) {
 			this.held = true;
-			this.theStateQueue.suspendAll();
+		}
+		// Basis: wait for the workers outside this monitor. A worker reporting
+		// a violation (or the end of the run) takes it before it can reach the
+		// queue's barrier, so waiting while holding it deadlocks.
+		this.theStateQueue.suspendAll();
+		synchronized (this) {
 			this.notifyAll();
 		}
 	}

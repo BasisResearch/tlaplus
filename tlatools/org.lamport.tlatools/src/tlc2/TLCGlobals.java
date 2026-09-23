@@ -231,6 +231,20 @@ public class TLCGlobals
         return n <= continuationTraceLimit;
     }
 
+    /**
+     * Whether the violation of this property being reported now will get no
+     * trace: TLC continues past violations and the property already printed
+     * as many traces as the limit allows. Read before
+     * {@link #continuationTraceAllowed} counts the report, under the same lock.
+     */
+    public static boolean continuationTraceCapped(final String property) {
+        if (!continuation || continuationTraceLimit < 0) {
+            return false;
+        }
+        final java.util.concurrent.atomic.AtomicInteger n = continuationTraces.get(property == null ? "" : property);
+        return (n == null ? 0 : n.get()) >= continuationTraceLimit;
+    }
+
     public static void resetContinuationTraces() {
         continuationTraces.clear();
     }

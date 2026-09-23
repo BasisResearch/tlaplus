@@ -72,12 +72,32 @@ public final class Recorder implements IMessagePrinterRecorder {
 	private final List<Trace> traces = new ArrayList<>();
 	/** How often each property was reported violated. */
 	private final java.util.LinkedHashMap<String, Integer> violationCounts = new java.util.LinkedHashMap<>();
+	/** Reports past the per-property trace cap, per property: counted, not kept as messages. */
+	private final java.util.LinkedHashMap<String, Long> untraced = new java.util.LinkedHashMap<>();
 	private JsonObject finalStats;
 	private int outcome = EC.NO_ERROR;
 	private String outcomeProperty;
 
 	@Override
 	public synchronized void record(final int code, final Object... objects) {
+		if ((code == EC.TLC_INVARIANT_VIOLATED_BEHAVIOR || code == EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR)
+				&& objects != null && objects.length > 0) {
+			final String property = String.valueOf(objects[0]);
+			if (tlc2.TLCGlobals.continuationTraceCapped(property)) {
+				// Past the per-property trace cap under continuation: no trace
+				// follows, so the report is counted, not kept. A run whose
+				// invariant fails on most states would otherwise keep a
+				// message and an empty trace per state.
+				if (outcome == EC.NO_ERROR) {
+					outcome = code;
+					outcomeProperty = property;
+				}
+				violationCounts.merge(property, 1, Integer::sum);
+				untraced.merge(property, 1L, Long::sum);
+				trace = null;
+				return;
+			}
+		}
 		final JsonObject message = new JsonObject();
 		message.addProperty("code", code);
 		final JsonArray params = new JsonArray();
@@ -202,6 +222,7 @@ public final class Recorder implements IMessagePrinterRecorder {
 		finishedTrace = null;
 		traces.clear();
 		violationCounts.clear();
+		untraced.clear();
 		finalStats = null;
 		outcome = EC.NO_ERROR;
 		outcomeProperty = null;
@@ -230,6 +251,13 @@ public final class Recorder implements IMessagePrinterRecorder {
 	/** Property name to the number of times TLC reported it violated. */
 	public synchronized Map<String, Integer> violationCounts() {
 		return new java.util.LinkedHashMap<>(violationCounts);
+	}
+
+	/** Property name to the reports past its trace cap, which carry no message or trace. */
+	public synchronized JsonObject untracedReports() {
+		final JsonObject out = new JsonObject();
+		untraced.forEach(out::addProperty);
+		return out;
 	}
 
 	/** The `TLC_STATS` line TLC prints at the end of a run, or null. */

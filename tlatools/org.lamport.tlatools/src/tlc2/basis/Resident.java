@@ -649,6 +649,8 @@ public final class Resident {
 			}
 		}
 		reply.add("traces", all);
+		// Reports past the cap are counted here instead of listed as messages.
+		reply.add("untraced_reports", recorder.untracedReports());
 		reply.add("invariants", invariantVerdicts(finished));
 		reply.addProperty("continuation", runContinuation);
 		reply.add("stats", stats());
