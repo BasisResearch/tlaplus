@@ -543,7 +543,9 @@ public class ModelChecker extends AbstractChecker
                         {
                             MP.printError(EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR, tool
                                     .getImpliedActNames()[k]);
-							this.trace.printTrace(curState, succState);
+							if (TLCGlobals.continuationTraceAllowed(tool.getImpliedActNames()[k])) {
+								this.trace.printTrace(curState, succState);
+							}
 							return false;
                        }
                     } else {

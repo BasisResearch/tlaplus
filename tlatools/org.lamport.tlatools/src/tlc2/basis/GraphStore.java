@@ -187,7 +187,7 @@ public final class GraphStore implements IStateWriter {
 	 * {@link #excludedIndex}: TLC checks invariants and state-level
 	 * properties on them too.
 	 */
-	private final List<Long> excludedInitial = new ArrayList<>();
+	private final java.util.Set<Long> excludedInitial = new java.util.LinkedHashSet<>();
 	private long edges;
 	private final LongAdder unsatisfied = new LongAdder();
 	private final LongAdder excluded = new LongAdder();
@@ -235,9 +235,7 @@ public final class GraphStore implements IStateWriter {
 			if (!excludedIndex.containsKey(fp)) {
 				excludedIndex.put(fp, new Entry(append(data), data.length, 1, 0, -1));
 			}
-			if (!excludedInitial.contains(fp)) {
-				excludedInitial.add(fp);
-			}
+			excludedInitial.add(fp);
 		}
 	}
 
@@ -716,8 +714,9 @@ public final class GraphStore implements IStateWriter {
 	/** The initial states a state constraint excluded, in the order they were written. */
 	public synchronized long[] excludedInitialFingerprints() {
 		final long[] out = new long[excludedInitial.size()];
-		for (int i = 0; i < out.length; i++) {
-			out[i] = excludedInitial.get(i);
+		int i = 0;
+		for (final Long fp : excludedInitial) {
+			out[i++] = fp;
 		}
 		return out;
 	}

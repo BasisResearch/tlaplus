@@ -110,6 +110,8 @@ public final class Resident {
 	private ModelChecker checker;
 	/** True after an incremental refresh: the store is current, the checker is not. */
 	private boolean refreshed;
+	/** Whether the last adopted refresh explored its whole graph; meaningful once {@link #refreshed}. */
+	private boolean refreshComplete;
 	/**
 	 * The last fully explored graph and the tool it was explored under: what
 	 * the next refresh replays from. Set by the first refresh from a finished
@@ -255,6 +257,7 @@ public final class Resident {
 		case "stats": {
 			final JsonObject reply = ok();
 			reply.add("stats", stats());
+			markStale(reply);
 			return reply;
 		}
 		case "trace":
@@ -291,6 +294,7 @@ public final class Resident {
 			final JsonObject reply = ok();
 			reply.add("stats", stats());
 			reply.add("registers", registers());
+			markStale(reply);
 			return reply;
 		}
 		case "store": {
@@ -1222,6 +1226,7 @@ public final class Resident {
 		// were never generated. Such a store is served, not replayed from.
 		final boolean stoppedAtViolation = !cont && !r.violations.isEmpty();
 		final boolean complete = !r.budgetExhausted && !stoppedAtViolation;
+		refreshComplete = complete;
 		if (complete) {
 			final GraphStore oldBase = baseStore;
 			baseTool = newTool;
@@ -1341,6 +1346,21 @@ public final class Resident {
 		o.addProperty("deadlock", checkDeadlock);
 		o.addProperty("guard_tallies", true);
 		return o;
+	}
+
+	/**
+	 * After an incremental refresh the checker's counters and registers
+	 * describe the run before it, not the refreshed store: say so, and say
+	 * whether the store now holds the whole graph, as the refresh reported.
+	 */
+	private void markStale(final JsonObject reply) {
+		if (!refreshed) {
+			return;
+		}
+		reply.addProperty("stale", true);
+		reply.addProperty("stale_reason",
+				"the store was refreshed incrementally; the counters and registers are the last full run's, over the spec as it was then (only `store` is current)");
+		reply.addProperty("refresh_complete", refreshComplete);
 	}
 
 	/** Release a store nothing refers to any more. */
