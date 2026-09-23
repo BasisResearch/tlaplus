@@ -182,6 +182,12 @@ public final class GraphStore implements IStateWriter {
 	 */
 	private final ConcurrentHashMap<TallyKey, Blocked> blocked = new ConcurrentHashMap<>();
 	private final List<Long> initial = new ArrayList<>();
+	/**
+	 * Initial states a state constraint excluded, kept in
+	 * {@link #excludedIndex}: TLC checks invariants and state-level
+	 * properties on them too.
+	 */
+	private final List<Long> excludedInitial = new ArrayList<>();
 	private long edges;
 	private final LongAdder unsatisfied = new LongAdder();
 	private final LongAdder excluded = new LongAdder();
@@ -217,6 +223,20 @@ public final class GraphStore implements IStateWriter {
 			if (!index.containsKey(fp)) {
 				store(fp, data, 1, 0, -1);
 				initial.add(fp);
+			}
+		}
+	}
+
+	@Override
+	public void writeExcludedInitial(final TLCState state) {
+		final long fp = state.fingerPrint();
+		final byte[] data = serialise(state);
+		synchronized (this) {
+			if (!excludedIndex.containsKey(fp)) {
+				excludedIndex.put(fp, new Entry(append(data), data.length, 1, 0, -1));
+			}
+			if (!excludedInitial.contains(fp)) {
+				excludedInitial.add(fp);
 			}
 		}
 	}
@@ -689,6 +709,15 @@ public final class GraphStore implements IStateWriter {
 		final long[] out = new long[initial.size()];
 		for (int i = 0; i < out.length; i++) {
 			out[i] = initial.get(i);
+		}
+		return out;
+	}
+
+	/** The initial states a state constraint excluded, in the order they were written. */
+	public synchronized long[] excludedInitialFingerprints() {
+		final long[] out = new long[excludedInitial.size()];
+		for (int i = 0; i < out.length; i++) {
+			out[i] = excludedInitial.get(i);
 		}
 		return out;
 	}

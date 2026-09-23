@@ -74,6 +74,14 @@ public interface IStateWriter {
 	 * it drops the context and forwards only a fully assigned successor, the
 	 * only kind upstream writers ever received here.
 	 */
+	/**
+	 * An initial state that a state constraint excludes from the model. TLC
+	 * checks invariants and state-level properties on it but never explores
+	 * it. The default ignores it, as upstream writers always have.
+	 */
+	default void writeExcludedInitial(TLCState state) {
+	}
+
 	default void writeUnsatisfied(TLCState state, Action action, TLCState successor, SemanticNode pred,
 			tlc2.util.Context c) {
 		if (successor != null && successor.allAssigned()) {

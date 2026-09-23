@@ -1241,6 +1241,10 @@ public class ModelChecker extends AbstractChecker
 							liveCheck.addInitState(tool.noDebug(), curState, fp);
 						}
 					}
+				} else {
+					// Basis: its invariants are checked below, so a writer
+					// that sweeps invariants later needs it too.
+					allStateWriter.writeExcludedInitial(curState);
 				}
 				// Check properties of the state:
 				if (!seen || forceChecks) {

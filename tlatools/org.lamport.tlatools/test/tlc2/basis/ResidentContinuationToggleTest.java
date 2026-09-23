@@ -43,7 +43,9 @@ public class ResidentContinuationToggleTest {
 			+ "EXTENDS Naturals\n" //
 			+ "VARIABLE x\n" //
 			+ "Init == x = 0\n" //
-			+ "Next == x < 40 /\\ x' = x + 1\n" //
+			// Enough states that the six-state budget below takes effect before
+			// the run ends: the budget is polled, not enforced per state.
+			+ "Next == x < 200000 /\\ x' = x + 1\n" //
 			+ "InvA == x # 3\n" //
 			+ "InvB == x # 3\n" //
 			+ "====\n";

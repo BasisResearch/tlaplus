@@ -57,13 +57,13 @@ import tlc2.util.Vect;
  *
  * <p>
  * The edited spec is parsed into a new {@link Tool}. Every action, invariant,
- * initial predicate, constraint, view and symmetry set gets a signature: its
+ * initial predicate and constraint gets a signature: its
  * own source text, the text of every user definition it reaches
  * (transitively, across modules), and the values its context binds (the
  * {@code p} of an action split out of {@code \E p \in S : A(p)}). Actions are
  * paired with the old ones by name and signature; invariants by name. If the
- * variables, the initial predicate, a state or action constraint, the view or
- * the symmetry set changed, or anything explored reads {@code TLCGet} (whose
+ * variables, the initial predicate or a state or action constraint changed,
+ * the spec has a VIEW or a SYMMETRY set, or anything explored reads {@code TLCGet} (whose
  * values depend on the path to a state, not the state), nothing can be
  * reused and the caller runs a fresh exploration instead; so does the caller
  * when the model config changed or the old exploration did not finish.
@@ -170,9 +170,12 @@ public final class Incremental {
 			d.fullRerunReason = "a state or action constraint changed";
 			return d;
 		}
-		if (!fingerprintSignature(oldTool).equals(fingerprintSignature(newTool))) {
-			d.fullRerunReason = "the view or the symmetry set changed";
-			return d;
+		for (final Tool t : new Tool[] { oldTool, newTool }) {
+			final String reason = fingerprintAbstraction(t);
+			if (reason != null) {
+				d.fullRerunReason = reason;
+				return d;
+			}
 		}
 		if (!substitutionSignature(oldTool).equals(substitutionSignature(newTool))) {
 			d.fullRerunReason = "a definition the config substitutes with <- changed";
@@ -453,21 +456,23 @@ public final class Incremental {
 		return def == null || def.getBody() == null ? rhs : rhs + " == " + signature(def.getBody(), null);
 	}
 
-	/** The view and symmetry set: they decide what a fingerprint identifies. */
-	private static String fingerprintSignature(final Tool tool) {
-		final StringBuilder sb = new StringBuilder();
-		sb.append("view ").append(signature(tool.getViewSpec(), null)).append('\n');
-		final String symmetry = tool.getModelConfig().getSymmetry();
-		if (symmetry != null && !symmetry.isEmpty()) {
-			sb.append("symmetry ").append(symmetry);
-			final OpDefNode[] defs = tool.getSpecProcessor().getRootModule().getOpDefs();
-			for (final OpDefNode def : defs == null ? new OpDefNode[0] : defs) {
-				if (def.getName().toString().equals(symmetry)) {
-					sb.append(' ').append(signature(def.getBody(), null));
-				}
-			}
+	/**
+	 * Why a replay cannot be trusted because {@code tool} fingerprints states
+	 * through a VIEW or a SYMMETRY set, or null. A fingerprint then names
+	 * several concrete states and TLC explores the one that reached it first.
+	 * The store keeps that one's content, which a copied edge from another
+	 * state need not generate, so a replay can explore a representative the
+	 * edited spec never reaches.
+	 */
+	private static String fingerprintAbstraction(final Tool tool) {
+		if (tool.getViewSpec() != null) {
+			return "the spec has a VIEW, under which a stored state may not be the one a copied edge reaches";
 		}
-		return sb.toString();
+		final String symmetry = tool.getModelConfig().getSymmetry();
+		if (tool.getSymmetryPerms() != null || (symmetry != null && !symmetry.isEmpty())) {
+			return "the spec has a SYMMETRY set, under which a stored state may not be the one a copied edge reaches";
+		}
+		return null;
 	}
 
 	/**
@@ -482,7 +487,6 @@ public final class Incremental {
 		final Action[] invariants = newTool.getInvariants();
 		final String[] invNames = newTool.getInvNames();
 		final Set<String> changedInv = new HashSet<>(diff.changedInvariants);
-		final boolean viewed = newTool.getViewSpec() != null;
 		// Forward adjacency of the old graph restricted to carried actions:
 		// fp -> (succ fp, new action) pairs.
 		final Map<Long, List<long[]>> forward = new HashMap<>();
@@ -512,6 +516,24 @@ public final class Incremental {
 			oldStates.add(fp);
 		}
 		boolean stop = false;
+		// Initial states the (unchanged) constraints exclude: never explored,
+		// but TLC checks invariants on them, so the changed ones are checked.
+		// All are stored before any is checked, so the state-level properties
+		// see every initial state however the replay stops.
+		final List<TLCState> excludedInitial = new ArrayList<>();
+		for (final long fp : oldStore.excludedInitialFingerprints()) {
+			final TLCState s = rebind(newTool, oldStore.read(fp));
+			if (s != null) {
+				newStore.writeExcludedInitial(s);
+				excludedInitial.add(s);
+			}
+		}
+		for (final TLCState s : excludedInitial) {
+			if (checkInvariants(newTool, s, s.fingerPrint(), 1, invariants, invNames, changedInv, continueOnViolation, r)) {
+				stop = true;
+				break;
+			}
+		}
 		while (!queue.isEmpty() && !stop) {
 			if (System.currentTimeMillis() - started > budgetMs) {
 				r.budgetExhausted = true;
@@ -519,12 +541,9 @@ public final class Incremental {
 			}
 			final long fp = queue.poll();
 			final TLCState state = rebind(newTool, newStore.read(fp));
-			// Under a VIEW a fingerprint names several concrete states, and the
-			// edited spec may reach this one first through another (a changed
-			// or added action). Its old edges were generated from the old
-			// content, so it survives only if the content is the same.
-			final boolean survivor = oldStates.contains(fp)
-					&& (!viewed || sameValues(state, oldStore.read(fp)));
+			// No VIEW or SYMMETRY (see fingerprintAbstraction): a fingerprint
+			// names one state, so a stored one keeps its old edges.
+			final boolean survivor = oldStates.contains(fp);
 			if (survivor) {
 				r.survivors++;
 				// Carried edges: copy successors and their content.
@@ -607,21 +626,6 @@ public final class Incremental {
 			}
 		}
 		throw new IllegalStateException("no action with id " + id);
-	}
-
-	/** Whether two states bind every variable to equal values. */
-	private static boolean sameValues(final TLCState a, final TLCState b) {
-		if (a == null || b == null) {
-			return false;
-		}
-		for (final tla2sany.semantic.OpDeclNode v : a.getVars()) {
-			final tlc2.value.IValue va = a.lookup(v.getName());
-			final tlc2.value.IValue vb = b.lookup(v.getName());
-			if (va == null ? vb != null : vb == null || !va.equals(vb)) {
-				return false;
-			}
-		}
-		return true;
 	}
 
 	/** A stored state rebuilt against the new spec's variable set. */
@@ -781,8 +785,8 @@ public final class Incremental {
 	}
 
 	/**
-	 * Evaluate every invariant on every stored state, excluded successors
-	 * included, as TLC evaluates them: exact per-invariant
+	 * Evaluate every invariant on every stored state, excluded successors and
+	 * excluded initial states included, as TLC evaluates them: exact per-invariant
 	 * verdicts for the refreshed graph, the first violation being the one at
 	 * the lowest level. Costs one evaluation per (state, invariant), no
 	 * successor generation.
@@ -840,7 +844,8 @@ public final class Incremental {
 
 	/**
 	 * Evaluate every state-level PROPERTY (TLC's implied inits, which it
-	 * checks on the initial states only) on the stored initial states: one
+	 * checks on the initial states only) on the stored initial states, those a
+	 * state constraint excluded included: one
 	 * {@link Sweep} per implied init, in order.
 	 */
 	public static List<Sweep> impliedInits(final Tool tool, final GraphStore store) {
@@ -850,7 +855,11 @@ public final class Incremental {
 		for (int k = 0; k < inits.length; k++) {
 			out.add(new Sweep(k < names.length ? names[k] : inits[k].getNameOfDefault()));
 		}
-		for (final long fp : store.initialFingerprints()) {
+		final long[] inModel = store.initialFingerprints();
+		final long[] excluded = store.excludedInitialFingerprints();
+		final long[] all = java.util.Arrays.copyOf(inModel, inModel.length + excluded.length);
+		System.arraycopy(excluded, 0, all, inModel.length, excluded.length);
+		for (final long fp : all) {
 			final TLCState state = rebind(tool, store.read(fp));
 			if (state == null) {
 				continue;

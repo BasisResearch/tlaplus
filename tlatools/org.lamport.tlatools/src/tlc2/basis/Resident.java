@@ -1048,8 +1048,8 @@ public final class Resident {
 	/**
 	 * Re-parse the spec after an edit and re-explore only what the edit
 	 * reaches (see {@link Incremental}). A change to the variables, the
-	 * initial predicate, a constraint, the view, the symmetry set or the
-	 * config, a spec that reads {@code TLCGet}, or a first run that did not
+	 * initial predicate, a constraint or the config, a VIEW or SYMMETRY set,
+	 * a spec that reads {@code TLCGet}, or a first run that did not
 	 * finish, leaves nothing to carry:
 	 * the reply asks for a restart and a full run.
 	 *

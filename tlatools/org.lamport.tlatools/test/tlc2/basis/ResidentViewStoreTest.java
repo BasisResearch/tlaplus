@@ -41,12 +41,11 @@ import com.google.gson.JsonObject;
  * Under a VIEW, several concrete states share a fingerprint and TLC explores
  * only the one whose fingerprint-set put won. The store must keep that one:
  * its recorded out-edges are the successors TLC generated from it, and the
- * store queries, the invariant sweeps and a refresh all work from its
+ * store queries and the invariant sweeps work from its
  * content. Here the hidden variable decides the successors, so content from
  * the wrong concrete state would disagree with the recorded edges. Run with
- * several workers, whose writes race for the store's lock; the check is the
- * same after a refresh, which replays that content and must not carry a
- * state's old edges onto different content the edit reaches first.
+ * several workers, whose writes race for the store's lock. A refresh under
+ * a VIEW asks for a full rerun and leaves the store as it was.
  */
 public class ResidentViewStoreTest {
 
@@ -122,19 +121,15 @@ public class ResidentViewStoreTest {
 		assertEquals(stats.get("distinct").getAsLong(), storeStates(stats));
 		assertEquals(storeStates(stats), consistent(h));
 
+		// A refresh under a VIEW is refused: a copied edge may reach a stored
+		// state other than the one it generates (ResidentRefreshViewTest).
+		// The store stays and still serves.
 		h.write("V.tla", spec(true));
 		final JsonObject r = h.ok("{\"command\":\"refresh\"}");
-		assertEquals(r.toString(), "incremental", r.get("mode").getAsString());
-		assertTrue(r.toString(), r.get("complete").getAsBoolean());
-		assertEquals(storeStates(r), consistent(h));
-		// What a fresh run of the edited spec stores (one worker, so which
-		// concrete state TLC keeps is fixed). The edit reaches x = 4 first
-		// with y = 1, whose successors reach x = 7; the old content's edges
-		// do not.
-		assertEquals(r.toString(), 8, storeStates(r));
-		assertEquals(r.toString(), 13, ResidentHarness.storeEdges(r));
-		assertEquals("no_violation_found",
-				r.getAsJsonArray("invariants").get(0).getAsJsonObject().get("verdict").getAsString());
+		assertEquals(r.toString(), "full", r.get("mode").getAsString());
+		assertTrue(r.toString(), r.get("restart_required").getAsBoolean());
+		assertTrue(r.toString(), r.get("reason").getAsString().contains("VIEW"));
+		assertEquals(storeStates(stats), consistent(h));
 		h.resident.shutdown();
 	}
 }
