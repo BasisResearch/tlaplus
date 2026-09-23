@@ -23,41 +23,36 @@
 package tlc2.basis;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 
 import org.junit.Test;
 
 import com.google.gson.JsonObject;
 
 /**
- * A PROPERTY that is false in an initial state is a violation, named as
- * such, not an error.
+ * Without a store an initial state's violation still has its one-state
+ * trace, the state kept as TLC printed it.
  */
-public class ResidentPropertyInitialTest {
+public class ResidentInitialViolationNoStoreTest {
 
 	@Test
-	public void testInitialPropertyViolation() throws Exception {
+	public void testInitialViolationKeepsPrintedState() throws Exception {
 		final ResidentHarness h = new ResidentHarness();
-		h.write("PI.cfg", "INIT Init\nNEXT Next\nPROPERTY Prop\n");
-		h.write("PI.tla", "---- MODULE PI ----\n" //
+		h.write("IN.cfg", "INIT Init\nNEXT Next\nINVARIANT Small\n");
+		h.write("IN.tla", "---- MODULE IN ----\n" //
 				+ "EXTENDS Naturals\n" //
 				+ "VARIABLE x\n" //
-				+ "Init == x = 0\n" //
-				+ "Next == x < 2 /\\ x' = x + 1\n" //
-				+ "Prop == x = 1\n" //
+				+ "Init == x \\in {0, 9}\n" //
+				+ "Next == x < 9 /\\ x' = x + 1\n" //
+				+ "Small == x < 8\n" //
 				+ "====\n");
-		h.ok("{\"command\":\"open\",\"spec\":\"" + h.spec("PI") + "\",\"workers\":1,\"deadlock\":false}");
+		h.ok("{\"command\":\"open\",\"spec\":\"" + h.spec("IN") + "\",\"workers\":1,\"deadlock\":false,\"store\":false}");
 		final JsonObject check = h.ok("{\"command\":\"check\"}");
-		assertEquals(check.toString(), "property_violated", check.get("verdict").getAsString());
-		assertEquals(check.toString(), "Prop", check.get("violated").getAsString());
-		// TLC prints the state only into its report; the trace carries it.
 		final JsonObject trace = check.getAsJsonObject("trace");
 		assertEquals(check.toString(), 1, trace.get("length").getAsInt());
-		assertEquals(check.toString(), 0, trace.getAsJsonArray("states").get(0).getAsJsonObject()
-				.getAsJsonObject("vars").get("x").getAsInt());
-		final JsonObject registers = h.ok("{\"command\":\"registers\"}").getAsJsonObject("registers");
-		assertFalse(registers.get("exhausted").getAsBoolean());
-		assertEquals(registers.toString(), "violation", registers.get("stopped_by").getAsString());
+		final JsonObject state = trace.getAsJsonArray("states").get(0).getAsJsonObject();
+		assertEquals(check.toString(), "x = 9", state.get("tla").getAsString().replace("/\\", "").trim());
+		final JsonObject small = check.getAsJsonArray("invariants").get(0).getAsJsonObject();
+		assertEquals(check.toString(), 1, small.get("level").getAsInt());
 		h.resident.shutdown();
 	}
 }

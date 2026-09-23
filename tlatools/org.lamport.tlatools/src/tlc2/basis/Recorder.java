@@ -63,6 +63,17 @@ public final class Recorder implements IMessagePrinterRecorder {
 		public boolean stuttering;
 		/** The ordinal the lasso loops back to, or null. */
 		public Integer lassoTo;
+		/**
+		 * For a violation in an initial state: the state as TLC printed it
+		 * into the report. TLC prints no trace for such a violation, so the
+		 * one-state trace is completed from this by {@link Recorder#completeInitial}.
+		 */
+		public String initialText;
+	}
+
+	/** Whether a code reports a violation in an initial state, which TLC prints no trace for. */
+	private static boolean isInitialViolation(final int code) {
+		return code == EC.TLC_INVARIANT_VIOLATED_INITIAL || code == EC.TLC_PROPERTY_VIOLATED_INITIAL;
 	}
 
 	private final List<JsonObject> messages = new ArrayList<>();
@@ -153,6 +164,9 @@ public final class Recorder implements IMessagePrinterRecorder {
 			trace = new Trace();
 			trace.code = code;
 			trace.property = property;
+			if (isInitialViolation(code) && objects != null && objects.length > 1) {
+				trace.initialText = String.valueOf(objects[1]);
+			}
 			traces.add(trace);
 			break;
 		case EC.TLC_BEHAVIOR_UP_TO_THIS_POINT:
@@ -257,6 +271,32 @@ public final class Recorder implements IMessagePrinterRecorder {
 		}
 		messages.clear();
 		return out;
+	}
+
+	/**
+	 * Give every violation in an initial state its one-state trace. TLC prints
+	 * the state only into the report's text, so {@code resolve} maps that text
+	 * to the state as a typed value ({@link #state}), or returns null, and the
+	 * state is then kept as TLC printed it, under {@code "tla"}. Such a trace
+	 * becomes the last complete counterexample when no other has been printed.
+	 */
+	public synchronized void completeInitial(final java.util.function.Function<String, JsonObject> resolve) {
+		for (final Trace t : traces) {
+			if (!isInitialViolation(t.code) || !t.states.isEmpty() || t.initialText == null) {
+				continue;
+			}
+			JsonObject s = resolve == null ? null : resolve.apply(t.initialText);
+			if (s == null) {
+				s = new JsonObject();
+				s.addProperty("tla", t.initialText);
+			}
+			s.addProperty("action", "<Initial predicate>");
+			s.addProperty("ordinal", 1);
+			t.states.add(s);
+			if (finishedTrace == null) {
+				finishedTrace = t;
+			}
+		}
 	}
 
 	/** The last complete counterexample, or null. */

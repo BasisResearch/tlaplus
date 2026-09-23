@@ -516,6 +516,8 @@ public final class Resident {
 		if (property != null) {
 			reply.addProperty("violated", property);
 		}
+		// No store in simulation: an initial state's violation keeps TLC's text.
+		recorder.completeInitial(null);
 		final JsonArray all = new JsonArray();
 		for (final Recorder.Trace t : recorder.traces()) {
 			all.add(traceJson(t));
@@ -684,6 +686,7 @@ public final class Resident {
 		if (property != null) {
 			reply.addProperty("violated", property);
 		}
+		recorder.completeInitial(initialStates());
 		final Recorder.Trace trace = recorder.trace();
 		if (trace != null) {
 			reply.add("trace", traceJson(trace));
@@ -705,6 +708,42 @@ public final class Resident {
 		reply.add("stats", stats());
 		reply.add("messages", recorder.drainMessages());
 		return reply;
+	}
+
+	/**
+	 * Maps the text TLC printed an initial state as, in a report of a
+	 * violation there, to that state from the store: every initial state is
+	 * stored before TLC checks it, those a constraint excludes included. The
+	 * text is matched against each stored initial state printed as TLC
+	 * printed it (through the ALIAS, if any), so the match is TLC's own
+	 * state. Null without a store; the recorder then keeps the text.
+	 */
+	private java.util.function.Function<String, JsonObject> initialStates() {
+		if (store == null) {
+			return null;
+		}
+		final Map<String, TLCState> byText = new HashMap<>();
+		return text -> {
+			if (byText.isEmpty()) {
+				final long[] in = store.initialFingerprints();
+				final long[] ex = store.excludedInitialFingerprints();
+				final long[] all = java.util.Arrays.copyOf(in, in.length + ex.length);
+				System.arraycopy(ex, 0, all, in.length, ex.length);
+				for (final long fp : all) {
+					final TLCState s = store.read(fp);
+					if (s == null) {
+						continue;
+					}
+					try {
+						byText.putIfAbsent(tool.evalAlias(s, s).toString(), s);
+					} catch (final RuntimeException e) {
+						// An ALIAS that does not evaluate here: that state keeps its text.
+					}
+				}
+			}
+			final TLCState s = byText.get(text);
+			return s == null ? null : Recorder.state(s);
+		};
 	}
 
 	private static JsonObject traceJson(final Recorder.Trace trace) {
