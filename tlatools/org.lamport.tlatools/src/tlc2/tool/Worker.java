@@ -286,6 +286,16 @@ public final class Worker extends IdThread implements IWorker, INextStateFunctor
 	 * cache in BufferedRandomAccessFile hasn't been flushed out.
 	 */
 	
+	/**
+	 * Close this worker's trace file. A run's cleanup closes the shared trace
+	 * but not the workers' files; a process that exits never notices, but one
+	 * that outlives its run (the resident) must close them before it can
+	 * delete the metadir on Windows.
+	 */
+	public final synchronized void closeTrace() throws IOException {
+		this.raf.close();
+	}
+
 	public final synchronized void writeState(final TLCState initialState, final long fp) throws IOException {
 		// Write initial state to trace file.
 		this.lastPtr = this.raf.getFilePointer();

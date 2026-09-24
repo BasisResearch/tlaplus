@@ -1857,6 +1857,17 @@ public final class Resident {
 			// a file another process still holds (a virus scanner) makes that
 			// fail; the session created the directory, so it finishes the job.
 			if (runMetadir != null) {
+				if (checker != null) {
+					for (final tlc2.tool.IWorker w : checker.getWorkers()) {
+						if (w instanceof tlc2.tool.Worker) {
+							try {
+								((tlc2.tool.Worker) w).closeTrace();
+							} catch (final IOException e) {
+								// Deleting below is what matters.
+							}
+						}
+					}
+				}
 				deleteTree(new File(runMetadir));
 				final File root = new File(runMetadir).getParentFile();
 				final String[] left = root == null ? null : root.list();
