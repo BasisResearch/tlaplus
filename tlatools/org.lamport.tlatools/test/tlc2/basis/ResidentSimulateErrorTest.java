@@ -57,6 +57,9 @@ public class ResidentSimulateErrorTest {
 		assertEquals(sim.toString(), "error", sim.get("verdict").getAsString());
 		assertNotEquals(sim.toString(), EC.NO_ERROR, sim.get("result_code").getAsInt());
 		assertEquals(sim.toString(), 4, sim.getAsJsonObject("trace").get("length").getAsInt());
+		// A simulate session keeps no store, and its store queries say so.
+		final JsonObject trace = h.call("{\"command\":\"trace\",\"fp\":1}");
+		assertEquals(trace.toString(), "no_store", trace.get("error_code").getAsString());
 		h.resident.shutdown();
 	}
 }

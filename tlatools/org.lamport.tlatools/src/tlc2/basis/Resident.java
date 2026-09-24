@@ -1079,6 +1079,9 @@ public final class Resident {
 	// ─── the store's queries ────────────────────────────────────────────
 
 	private JsonObject notOpen() {
+		if (simulator != null) {
+			return error(null, "no_store", "this is a simulate session, which keeps no store; open a check session to query one");
+		}
 		if (tool != null && !storing) {
 			return error(null, "no_store", "this session was opened with store: false; reopen with the store to query it");
 		}
@@ -1155,9 +1158,10 @@ public final class Resident {
 			baseTool = tool;
 			baseStore = store;
 		}
-		// Parsing rebinds the process-global name slots; kept to put them back
-		// if the edited spec is not adopted.
-		final Map<util.UniqueString, Integer> slots = nameSlots();
+		// Parsing rebinds the process-global name slots and resets the
+		// model-value table; kept to put them back if the edited spec is not
+		// adopted.
+		final Statics slots = statics();
 		final Tool newTool;
 		try {
 			newTool = new FastTool(mainFile, configName, new SimpleFilenameToStream(specDir), Tool.Mode.MC,
@@ -1173,6 +1177,11 @@ public final class Resident {
 		final JsonObject reply = ok();
 		reply.add("diff", Incremental.diffJson(diff));
 		reply.addProperty("front_end_ms", System.currentTimeMillis() - started);
+		if (diff.fullRerunReason == null && !slots.modelValues.isPrefixOf(tlc2.value.impl.ModelValue.snapshot())) {
+			// Stored states name a model value by its index in the table the
+			// parse rebuilt; a renumbered one would decode as another value.
+			diff.fullRerunReason = "the model values were renumbered, so stored states would decode as other states";
+		}
 		if (diff.fullRerunReason != null) {
 			rebindStatics(tool, slots);
 			return fullRerun(reply, diff.fullRerunReason, started);
@@ -1217,6 +1226,13 @@ public final class Resident {
 		reply.addProperty("edges_copied", r.edgesCopied);
 		reply.addProperty("edges_generated", r.edgesGenerated);
 		reply.addProperty("budget_exhausted", r.budgetExhausted);
+		if (r.restartReason != null) {
+			// A stored state did not read back as itself: nothing can be carried.
+			newStore.dispose();
+			rebindStatics(tool, slots);
+			reply.addProperty("adopted", false);
+			return fullRerun(reply, r.restartReason, started);
+		}
 		if (r.error != null) {
 			// The edited spec does not evaluate; keep serving what was there.
 			newStore.dispose();
@@ -1412,21 +1428,27 @@ public final class Resident {
 	/**
 	 * Rebind TLC's static variable tables to {@code old} after parsing a spec
 	 * that was not adopted. Parsing assigns each variable name its slot and
-	 * sets the variable count, the empty state and the state's tool; this
-	 * puts the old spec's back, and every name's slot as {@code slots}
-	 * recorded it before the parse (a definition of the old spec that the
-	 * new one declares a variable would otherwise evaluate as that
-	 * variable). Should a definition still read as a variable, nothing that
+	 * sets the variable count, the empty state and the state's tool, and it
+	 * resets the model-value table; this puts the old spec's back, the
+	 * model-value table and every name's slot as {@code saved} recorded
+	 * them before the parse (a definition of the old spec that the new one
+	 * declares a variable would otherwise evaluate as that variable, and a
+	 * stored model value would decode against the edited spec's
+	 * numbering). Should a definition still read as a variable, nothing that
 	 * evaluates against the spec is served any more.
 	 */
-	private void rebindStatics(final Tool old, final Map<util.UniqueString, Integer> slots) {
+	private void rebindStatics(final Tool old, final Statics saved) {
 		// Every name's slot as it was before the parse: a definition of the
 		// old spec that the edited one declares a variable gets its definition
 		// slot back. A name first seen in the parse gets none.
 		for (final util.UniqueString u : util.UniqueString.internTbl.toMap().values()) {
-			final Integer loc = slots.get(u);
+			final Integer loc = saved.slots.get(u);
 			u.setLoc(loc == null ? -1 : loc);
 		}
+		// The model values the stored states were serialised against: the
+		// parse reset the table, and a stored state names a model value by
+		// its index there.
+		tlc2.value.impl.ModelValue.restore(saved.modelValues);
 		final tla2sany.semantic.OpDeclNode[] vars = old.getSpecProcessor().getVariablesNodes();
 		for (int i = 0; i < vars.length; i++) {
 			vars[i].getName().setLoc(i);
@@ -1443,12 +1465,19 @@ public final class Resident {
 		}
 	}
 
-	/** Every interned name's slot in a state or the definition table (-1 for none). */
-	private static Map<util.UniqueString, Integer> nameSlots() {
-		final Map<util.UniqueString, Integer> out = new java.util.IdentityHashMap<>();
+	/** What a parse overwrites in TLC's process-global state, taken before it. */
+	private static final class Statics {
+		/** Every interned name's slot in a state or the definition table (-1 for none). */
+		final Map<util.UniqueString, Integer> slots = new java.util.IdentityHashMap<>();
+		/** The model-value table, which every parse resets. */
+		final tlc2.value.impl.ModelValue.Table modelValues = tlc2.value.impl.ModelValue.snapshot();
+	}
+
+	private static Statics statics() {
+		final Statics out = new Statics();
 		for (final util.UniqueString u : util.UniqueString.internTbl.toMap().values()) {
 			// A slot is either a variable's or a definition's.
-			out.put(u, Math.max(u.getVarLoc(), u.getDefnLoc()));
+			out.slots.put(u, Math.max(u.getVarLoc(), u.getDefnLoc()));
 		}
 		return out;
 	}
@@ -1777,6 +1806,18 @@ public final class Resident {
 			} catch (final InterruptedException e) {
 				Thread.currentThread().interrupt();
 			}
+		}
+		// The stores' files (and a refresh's own metadir) live under the
+		// spec's directory; nothing reads them once the session ends.
+		if (checkerThread == null || !checkerThread.isAlive()) {
+			if (baseStore != null && baseStore != store) {
+				baseStore.dispose();
+			}
+			if (store != null) {
+				store.dispose();
+			}
+			baseStore = null;
+			store = null;
 		}
 	}
 

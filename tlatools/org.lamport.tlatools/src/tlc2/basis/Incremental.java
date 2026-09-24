@@ -128,6 +128,12 @@ public final class Incremental {
 		public boolean budgetExhausted;
 		public final List<Violation> violations = new ArrayList<>();
 		public String error;
+		/**
+		 * Set when a stored state does not read back as the state it was
+		 * stored as (its fingerprint under the edited spec differs): nothing
+		 * copied from the old store can be trusted, so the caller restarts.
+		 */
+		public String restartReason;
 	}
 
 	private Incremental() {
@@ -503,11 +509,14 @@ public final class Incremental {
 		final Set<Long> seen = new HashSet<>();
 		// Initial states are unchanged (the init predicate is), so they seed.
 		for (final long fp : oldStore.initialFingerprints()) {
-			final TLCState s = oldStore.read(fp);
+			final TLCState s = carry(newTool, oldStore, fp, r);
+			if (r.restartReason != null) {
+				return r;
+			}
 			if (s == null) {
 				continue;
 			}
-			newStore.writeState(rebind(newTool, s));
+			newStore.writeState(s);
 			seen.add(fp);
 			queue.add(fp);
 		}
@@ -522,7 +531,10 @@ public final class Incremental {
 		// see every initial state however the replay stops.
 		final List<TLCState> excludedInitial = new ArrayList<>();
 		for (final long fp : oldStore.excludedInitialFingerprints()) {
-			final TLCState s = rebind(newTool, oldStore.read(fp));
+			final TLCState s = carry(newTool, oldStore, fp, r);
+			if (r.restartReason != null) {
+				return r;
+			}
 			if (s != null) {
 				newStore.writeExcludedInitial(s);
 				excludedInitial.add(s);
@@ -552,7 +564,10 @@ public final class Incremental {
 						final long to = e[0];
 						final Action a = newTool.getActions()[actionIndex(newTool, (int) e[1])];
 						final TLCState succ = newStore.contains(to) ? newStore.read(to)
-								: rebind(newTool, oldStore.read(to));
+								: carry(newTool, oldStore, to, r);
+						if (r.restartReason != null) {
+							return r;
+						}
 						if (succ == null) {
 							continue;
 						}
@@ -584,7 +599,10 @@ public final class Incremental {
 						}
 						final long to = e[0];
 						final boolean fresh = !newStore.contains(to) && !newStore.isExcluded(to);
-						final TLCState succ = fresh ? rebind(newTool, oldStore.read(to)) : newStore.read(to);
+						final TLCState succ = fresh ? carry(newTool, oldStore, to, r) : newStore.read(to);
+						if (r.restartReason != null) {
+							return r;
+						}
 						if (succ == null) {
 							continue;
 						}
@@ -626,6 +644,33 @@ public final class Incremental {
 			}
 		}
 		throw new IllegalStateException("no action with id " + id);
+	}
+
+	/**
+	 * The old store's state {@code fp} rebuilt against the new spec, or null
+	 * when it is not stored. Copying it is sound only if it is the same state:
+	 * when its fingerprint under the new spec differs (a value that decodes
+	 * differently now, such as a model value renumbered by the parse), sets
+	 * {@link Result#restartReason} and returns null.
+	 */
+	private static TLCState carry(final Tool tool, final GraphStore oldStore, final long fp, final Result r) {
+		final TLCState s;
+		final long now;
+		try {
+			s = rebind(tool, oldStore.read(fp));
+			if (s == null) {
+				return null;
+			}
+			now = s.fingerPrint();
+		} catch (final RuntimeException e) {
+			r.restartReason = "a stored state does not decode under the edited spec (" + e + "), so the old graph cannot be carried";
+			return null;
+		}
+		if (now != fp) {
+			r.restartReason = "a stored state does not read back as the same state under the edited spec (its fingerprint changed), so the old graph cannot be carried";
+			return null;
+		}
+		return s;
 	}
 
 	/** A stored state rebuilt against the new spec's variable set. */

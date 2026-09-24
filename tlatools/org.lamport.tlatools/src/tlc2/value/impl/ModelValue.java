@@ -118,6 +118,56 @@ public class ModelValue extends Value implements IModelValue {
 	    return mv;
 	}
 
+  /**
+   * Basis: the process-global model-value table, as {@link #snapshot} took
+   * it. Every parse resets the table ({@link #init}), and serialised values
+   * name a model value by its index here, so a caller that parses a second
+   * spec in one process and keeps the first puts the first one's table back.
+   */
+  public static final class Table {
+    private final int count;
+    private final Hashtable<String, ModelValue> table;
+    private final ModelValue[] values;
+
+    private Table(final int count, final Hashtable<String, ModelValue> table, final ModelValue[] values) {
+      this.count = count;
+      this.table = table;
+      this.values = values;
+    }
+
+    /**
+     * Whether every model value of this table has the same index in
+     * {@code later}: a value serialised under this table then decodes to the
+     * same model value under {@code later}, which may have added more.
+     */
+    public boolean isPrefixOf(final Table later) {
+      final ModelValue[] mine = this.values == null ? new ModelValue[0] : this.values;
+      final ModelValue[] theirs = later.values == null ? new ModelValue[0] : later.values;
+      if (mine.length > theirs.length) {
+        return false;
+      }
+      for (int i = 0; i < mine.length; i++) {
+        if (mine[i] == null || theirs[i] == null || !mine[i].val.equals(theirs[i].val)
+            || mine[i].type != theirs[i].type) {
+          return false;
+        }
+      }
+      return true;
+    }
+  }
+
+  /** Basis: the current model-value table, to {@link #restore} later. */
+  public static synchronized Table snapshot() {
+    return new Table(count, mvTable, mvs);
+  }
+
+  /** Basis: put back a table {@link #snapshot} took; {@link #init} replaced it, it was not mutated. */
+  public static synchronized void restore(final Table t) {
+    count = t.count;
+    mvTable = t.table;
+    mvs = t.values;
+  }
+
   /* Collect all the model values defined thus far. */
   public static void setValues() {
     mvs = new ModelValue[mvTable.size()];
