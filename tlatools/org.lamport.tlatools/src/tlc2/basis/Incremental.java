@@ -292,13 +292,56 @@ public final class Incremental {
 				return "the invariant " + a.getNameOfDefault() + " reads TLCGet, which depends on the path to a state";
 			}
 		}
+		// The definitions the config substitutes in are bound as tool
+		// objects, so the walks above never reach them (see
+		// substitutionSignature): check each one itself.
+		final Map<String, OpDefNode> byName = new HashMap<>();
+		final OpDefNode[] defs = tool.getSpecProcessor().getRootModule().getOpDefs();
+		for (final OpDefNode def : defs == null ? new OpDefNode[0] : defs) {
+			byName.put(def.getName().toString(), def);
+		}
+		final Map<String, String> rhs = new TreeMap<>(tool.getModelConfig().getOverrides());
+		final Map<?, ?> modOverrides = tool.getModelConfig().getModOverrides();
+		for (final Map.Entry<?, ?> m : modOverrides.entrySet()) {
+			for (final Map.Entry<?, ?> e : ((Map<?, ?>) m.getValue()).entrySet()) {
+				rhs.put(m.getKey() + "!" + e.getKey(), String.valueOf(e.getValue()));
+			}
+		}
+		for (final Map.Entry<String, String> e : rhs.entrySet()) {
+			final OpDefNode def = byName.get(e.getValue());
+			if (def == null) {
+				continue;
+			}
+			final Map<String, String> reached = new TreeMap<>();
+			reachDefinition(def, reached, new HashSet<>());
+			if (pathDependent(reached)) {
+				return "the config substitutes " + e.getKey() + " <- " + e.getValue()
+						+ ", which reads TLCGet or the behaviour, which depend on the path to a state";
+			}
+		}
 		return null;
+	}
+
+	/**
+	 * Operators whose value depends on how a state was reached: TLC's
+	 * registers, and TLCExt's behaviour-so-far operators (overridden in Java
+	 * to read the predecessor chain, which a replay does not set).
+	 */
+	private static final Set<String> PATH_DEPENDENT = Set.of("TLC!TLCGet", "TLCExt!Trace", "TLCExt!CounterExample");
+
+	private static boolean pathDependent(final Map<String, String> reached) {
+		for (final String name : PATH_DEPENDENT) {
+			if (reached.containsKey(name)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private static boolean reachesTLCGet(final SemanticNode node) {
 		final Map<String, String> reached = new TreeMap<>();
 		reach(node, reached, new HashSet<>());
-		return reached.containsKey("TLC!TLCGet");
+		return pathDependent(reached);
 	}
 
 	/** Claim the first old action of {@code candidates} not yet paired; false when none is left. */
