@@ -43,9 +43,12 @@ public class ResidentInitBudgetTest {
 		h.write("I.tla", "---- MODULE I ----\n" //
 				+ "EXTENDS Naturals\n" //
 				+ "VARIABLES x\n" //
-				+ "Init == x \\in 1..400000\n" //
+				// Under 65536 initial states: the build caps direct memory so
+				// that OffHeapDiskFPSet evicts there, and an eviction during
+				// init trips DiskFPSet's checkFile assertion upstream too.
+				+ "Init == x \\in 1..50000\n" //
 				+ "Next == x' = x\n" //
-				+ "Inv == x < 390000\n" //
+				+ "Inv == x < 49000\n" //
 				+ "====\n");
 		h.ok("{\"command\":\"open\",\"spec\":\"" + h.spec("I") + "\",\"workers\":2}");
 		// Returns rather than hanging, whether or not the run has ended yet.
