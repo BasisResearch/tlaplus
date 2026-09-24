@@ -696,7 +696,19 @@ public final class Resident {
 			reply.addProperty("error", checkerFailure.toString());
 		} else if (finished) {
 			reply.addProperty("result_code", resultCode);
-			reply.addProperty("verdict", verdict(resultCode, recorder.outcome()));
+			String verdict = verdict(resultCode, recorder.outcome());
+			final Integer error = errorCode();
+			if (error != null) {
+				// An evaluation error cut some expansion short, whatever code
+				// the run ended on and whatever was violated before it.
+				reply.addProperty("error_code", error);
+				if (!"evaluation_failed".equals(verdict)) {
+					verdict = "error";
+					reply.addProperty("error",
+							"TLC hit an error (code " + error + ") that left states unexpanded; the messages say what");
+				}
+			}
+			reply.addProperty("verdict", verdict);
 		} else {
 			reply.addProperty("verdict", "unfinished");
 		}
@@ -906,7 +918,7 @@ public final class Resident {
 	 */
 	private boolean explorationComplete() {
 		if (checkerThread == null || checkerThread.isAlive() || checkerFailure != null || resultCode == null
-				|| checker.getStateQueueSize() != 0) {
+				|| checker.getStateQueueSize() != 0 || errorCode() != null) {
 			return false;
 		}
 		switch (resultCode) {
@@ -921,6 +933,25 @@ public final class Resident {
 		default:
 			return false;
 		}
+	}
+
+	/**
+	 * The first error the run hit that is not a violation, or null. Under
+	 * continuation TLC keeps going after an evaluation error and a later code
+	 * overwrites it (the state whose expansion the error aborted is then
+	 * reported as a deadlock), so the result code alone does not say whether
+	 * every state was fully expanded; the checker keeps every code it set.
+	 */
+	private Integer errorCode() {
+		if (checker == null) {
+			return null;
+		}
+		for (final int code : checker.getErrorCodes()) {
+			if (!isViolation(code)) {
+				return code;
+			}
+		}
+		return null;
 	}
 
 	/** Whether a result code reports a property violated (or a deadlock), not an error. */
@@ -984,7 +1015,7 @@ public final class Resident {
 		final boolean exhausted = finished && explorationComplete();
 		r.addProperty("finished", finished);
 		r.addProperty("exhausted", exhausted);
-		r.addProperty("stopped_by", checkerFailure != null ? "error"
+		r.addProperty("stopped_by", checkerFailure != null || (finished && errorCode() != null) ? "error"
 				: !finished ? (checkerThread == null ? "not_started" : "budget")
 				// Under continuation a run that reported violations still ends
 				// on NO_ERROR, so the recorder, not the code, says if it found any.

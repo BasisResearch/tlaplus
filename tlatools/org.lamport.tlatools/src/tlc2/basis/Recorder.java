@@ -76,6 +76,26 @@ public final class Recorder implements IMessagePrinterRecorder {
 		return code == EC.TLC_INVARIANT_VIOLATED_INITIAL || code == EC.TLC_PROPERTY_VIOLATED_INITIAL;
 	}
 
+	/**
+	 * Whether a code opens a violation report, whose behaviour TLC prints
+	 * once. An evaluation failure's behaviour may be printed twice (the rerun
+	 * that rebuilds its call stack).
+	 */
+	private static boolean isViolationReport(final int code) {
+		switch (code) {
+		case EC.TLC_INVARIANT_VIOLATED_INITIAL:
+		case EC.TLC_INVARIANT_VIOLATED_BEHAVIOR:
+		case EC.TLC_INVARIANT_VIOLATED_LEVEL:
+		case EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR:
+		case EC.TLC_TEMPORAL_PROPERTY_VIOLATED:
+		case EC.TLC_PROPERTY_VIOLATED_INITIAL:
+		case EC.TLC_DEADLOCK_REACHED:
+			return true;
+		default:
+			return false;
+		}
+	}
+
 	private final List<JsonObject> messages = new ArrayList<>();
 	private Trace trace;
 	private Trace finishedTrace;
@@ -173,7 +193,14 @@ public final class Recorder implements IMessagePrinterRecorder {
 			// The behaviour is printed from its first state on. When TLC prints
 			// it again for the same report (an evaluation error re-run to
 			// rebuild its call stack), the reprint replaces what came before.
-			if (trace != null && !trace.states.isEmpty()) {
+			// A violation's trace is printed once: a behaviour printed after it
+			// belongs to a later report that opened with no code of its own (a
+			// next-state evaluation error under continuation), so it starts a
+			// trace of its own rather than overwriting the violation's.
+			if (trace != null && !trace.states.isEmpty() && isViolationReport(trace.code)) {
+				trace = new Trace();
+				trace.code = code;
+			} else if (trace != null && !trace.states.isEmpty()) {
 				trace.states.clear();
 				trace.stuttering = false;
 				trace.lassoTo = null;
