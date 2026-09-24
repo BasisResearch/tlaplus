@@ -505,6 +505,10 @@
 		<echo>Running tests across ${threadLimit} threads</echo>
 		<!-- run junit tests -->
 		<mkdir dir="${test.reports}" />
+		<!-- Tests pass -teSpecOutDir target/GeneratedTESpecs, and a _TLCTrace
+		     POSTCONDITION writes its .bin there before TLC creates the directory,
+		     so a test that runs before any other has made it fails. -->
+		<mkdir dir="target/GeneratedTESpecs" />
 		<!-- First run unit tests which due to their nature cannot be run in parallel. -->
 		<junit
 			printsummary="yes"
