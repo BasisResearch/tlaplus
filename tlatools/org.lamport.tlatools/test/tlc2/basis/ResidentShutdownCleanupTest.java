@@ -56,6 +56,13 @@ public class ResidentShutdownCleanupTest {
 		}
 	}
 
+	/** Everything left under the spec's directory, for a failure message. */
+	private static String left(final ResidentHarness h) throws Exception {
+		try (Stream<java.nio.file.Path> files = Files.walk(h.dir)) {
+			return files.map(p -> h.dir.relativize(p).toString()).collect(java.util.stream.Collectors.joining(", "));
+		}
+	}
+
 	/** The metadirs left under the spec's directory. */
 	private static long metadirs(final ResidentHarness h) throws Exception {
 		final java.nio.file.Path states = h.dir.resolve("states");
@@ -84,7 +91,7 @@ public class ResidentShutdownCleanupTest {
 		assertTrue(metadirs(h) >= 1);
 
 		h.resident.shutdown();
-		assertEquals(0, storeFiles(h));
-		assertEquals(0, metadirs(h));
+		assertEquals(left(h), 0, storeFiles(h));
+		assertEquals(left(h), 0, metadirs(h));
 	}
 }

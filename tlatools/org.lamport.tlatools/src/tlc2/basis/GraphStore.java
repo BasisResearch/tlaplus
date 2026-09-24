@@ -434,14 +434,34 @@ public final class GraphStore implements IStateWriter {
 			// Deleting below is what matters.
 		}
 		pending.reset();
-		file.delete();
+		delete(file);
 		final File dir = file.getParentFile();
 		if (dir != null) {
 			final String[] left = dir.list();
 			if (left != null && left.length == 0) {
-				dir.delete();
+				delete(dir);
 			}
 		}
+	}
+
+	/**
+	 * Delete {@code f}, retrying briefly: on Windows another process (a virus
+	 * scanner, the indexer) can hold a freshly written file open for a moment,
+	 * and the delete fails until it lets go. Left to the JVM's exit otherwise.
+	 */
+	private static void delete(final File f) {
+		for (int attempt = 0; attempt < 20; attempt++) {
+			if (f.delete() || !f.exists()) {
+				return;
+			}
+			try {
+				Thread.sleep(25);
+			} catch (final InterruptedException e) {
+				Thread.currentThread().interrupt();
+				break;
+			}
+		}
+		f.deleteOnExit();
 	}
 
 	@Override
