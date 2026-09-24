@@ -210,6 +210,45 @@ public class TLCGlobals
     // Continue running even when invariant is violated
     public static boolean continuation = false;
 
+    /**
+     * Basis: under continuation, regenerate and print at most this many
+     * counterexample traces per invariant or implied action (a trace is
+     * rebuilt by re-running the next-state relation from an initial state,
+     * which dominates a run whose invariant fails on most states). Further
+     * violations are still reported by message, so they are counted, but
+     * without a trace. Negative means no limit, as upstream.
+     */
+    public static int continuationTraceLimit = -1;
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger> continuationTraces = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Whether a trace should still be printed for this property's violation. */
+    public static boolean continuationTraceAllowed(final String property) {
+        if (continuationTraceLimit < 0) {
+            return true;
+        }
+        final int n = continuationTraces.computeIfAbsent(property == null ? "" : property,
+                k -> new java.util.concurrent.atomic.AtomicInteger()).incrementAndGet();
+        return n <= continuationTraceLimit;
+    }
+
+    /**
+     * Whether the violation of this property being reported now will get no
+     * trace: TLC continues past violations and the property already printed
+     * as many traces as the limit allows. Read before
+     * {@link #continuationTraceAllowed} counts the report, under the same lock.
+     */
+    public static boolean continuationTraceCapped(final String property) {
+        if (!continuation || continuationTraceLimit < 0) {
+            return false;
+        }
+        final java.util.concurrent.atomic.AtomicInteger n = continuationTraces.get(property == null ? "" : property);
+        return (n == null ? 0 : n.get()) >= continuationTraceLimit;
+    }
+
+    public static void resetContinuationTraces() {
+        continuationTraces.clear();
+    }
+
     // Prints only the state difference in state traces
     public static boolean printDiffsOnly = false;
 

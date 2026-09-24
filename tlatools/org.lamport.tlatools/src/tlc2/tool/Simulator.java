@@ -725,6 +725,38 @@ public class Simulator {
 
 	private enum ActionContexts { KEEP, REDUCE }
 
+	/**
+	 * The action-pair follow matrix as data: for actions i and j (reduced to
+	 * one vertex per definition), how often j followed i across every worker's
+	 * traces. Populated only when {@link #EXTENDED_STATISTICS} was set at
+	 * class load (the {@code tlc2.tool.Simulator.extendedStatistics} system
+	 * property); otherwise every count is zero, and the caller must not read
+	 * those zeros as observations.
+	 */
+	public com.google.gson.JsonObject actionFlowAsJson() {
+		final com.google.gson.JsonObject out = new com.google.gson.JsonObject();
+		out.addProperty("extended_statistics", EXTENDED_STATISTICS);
+		if (workers == null || workers.isEmpty()) {
+			return out;
+		}
+		final ActionFlowGraphSnapshot snap = getActionFlowGraphSnapshot(ActionContexts.REDUCE);
+		final com.google.gson.JsonArray names = new com.google.gson.JsonArray();
+		for (final Action a : snap.actions) {
+			names.add(a.getNameOfDefault());
+		}
+		out.add("actions", names);
+		final com.google.gson.JsonArray rows = new com.google.gson.JsonArray();
+		for (final long[] row : snap.actionStats) {
+			final com.google.gson.JsonArray r = new com.google.gson.JsonArray();
+			for (final long v : row) {
+				r.add(v);
+			}
+			rows.add(r);
+		}
+		out.add("follows", rows);
+		return out;
+	}
+
 	private ActionFlowGraphSnapshot getActionFlowGraphSnapshot(final ActionContexts contexts) {
 		// The number of actions is expected to be low (dozens commons and hundreds are
 		// rare). This is why the code below isn't optimized for performance.

@@ -898,6 +898,18 @@ public abstract class Tool
 	  return getNextStates(action, action.con, state);
   }
   
+  /**
+   * Basis: {@link #getNextStates(Action, TLCState)} without counting the
+   * evaluation in the action's coverage, for queries made outside a run
+   * (the resident's successor queries) that must not change its report.
+   */
+  public final StateVec getNextStatesUnrecorded(final Action action, final TLCState state) {
+    final StateVec nss = new StateVec(0);
+    this.getNextStates(action, action.pred, ActionItemList.Empty, action.con, state,
+        TLCState.Empty.createEmpty().setPredecessor(state).setAction(action), nss, CostModel.DO_NOT_RECORD);
+    return nss;
+  }
+
   public final StateVec getNextStates(final Action action, final Context ctx, final TLCState state) {
     ActionItemList acts = ActionItemList.Empty;
     TLCState s1 = TLCState.Empty.createEmpty();
@@ -1092,7 +1104,20 @@ public abstract class Tool
 			final SemanticNode pred, final Context c, final INextStateFunctor nss, final CostModel cm) {
 	return nss.addUnsatisfiedState(s0, action, s1, pred, c);
   }
-  
+
+  /**
+   * Basis: a guard conjunct evaluated false on a path where upstream TLC
+   * reported nothing. The functor hears of it (a constrained state writer
+   * tallies it), but unlike {@link #processUnsatisfied} this is not a
+   * debugger frame, and {@code s1} may still have unassigned variables.
+   * Returns {@code s1}, which is what these paths returned before.
+   */
+  private TLCState falseGuard(final TLCState s0, final Action action, final TLCState s1,
+			final SemanticNode pred, final Context c, final INextStateFunctor nss) {
+	nss.addUnsatisfiedState(s0, action, s1, pred, c);
+	return s1;
+  }
+
   /* getNextStatesAppl */
 
   @ExpectInlined
@@ -1179,7 +1204,8 @@ public abstract class Tool
 		  return this.getNextStates0(action, acts, s0, s1, nss, cm);
 	  }
 	}
-	return s1;
+	// Basis: a user-defined guard evaluated false; its bindings are not at hand here.
+	return this.falseGuard(s0, action, s1, pred, Context.Empty, nss);
   }
 
   private final TLCState getNextStatesApplSwitch(final Action action, final OpApplNode pred, final ActionItemList acts, final Context c, final TLCState s0,
@@ -1357,7 +1383,7 @@ public abstract class Tool
 	    if (var == null) {
 	      Value bval = this.eval(pred, c, s0, s1, EvalControl.Clear, cm);
 	      if (!((BoolValue)bval).val) {
-	        return resState;
+	        return this.falseGuard(s0, action, resState, pred, c, nss);
 	      }
 	    }
 	    else {
@@ -1371,7 +1397,7 @@ public abstract class Tool
 	        return resState;
 	      }
 	      else if (!lval.equals(rval)) {
-	        return resState;
+	        return this.falseGuard(s0, action, resState, pred, c, nss);
 	      }
 	    }
 	    return this.getNextStates(action, acts, s0, s1, nss, cm);
@@ -1382,7 +1408,7 @@ public abstract class Tool
 	    if (var == null) {
 	      Value bval = this.eval(pred, c, s0, s1, EvalControl.Clear, cm);
 	      if (!((BoolValue)bval).val) {
-	        return resState;
+	        return this.falseGuard(s0, action, resState, pred, c, nss);
 	      }
 	    }
 	    else {
@@ -1414,7 +1440,7 @@ public abstract class Tool
 	        return resState;
 	      }
 	      else if (!rval.member(lval)) {
-	        return resState;
+	        return this.falseGuard(s0, action, resState, pred, c, nss);
 	      }
 	    }
 	    return this.getNextStates(action, acts, s0, s1, nss, cm);
@@ -1426,7 +1452,7 @@ public abstract class Tool
 	    if (var == null) {
 	      Value bval = this.eval(pred, c, s0, s1, EvalControl.Clear, cm);
 	      if (!((BoolValue)bval).val) {
-	        return resState;
+	        return this.falseGuard(s0, action, resState, pred, c, nss);
 	      }
 	    }
 	    else {
@@ -1462,7 +1488,7 @@ public abstract class Tool
 	        return resState;
 	      }
 	      else if (!rval.member(lval)) {
-	        return resState;
+	        return this.falseGuard(s0, action, resState, pred, c, nss);
 	      }
 	    }
 	    return this.getNextStates(action, acts, s0, s1, nss, cm);
@@ -1545,6 +1571,10 @@ public abstract class Tool
 	    }
 	    if (((BoolValue)bval).val) {
 	      resState = this.getNextStates(action, acts, s0, s1, nss, cm);
+	    } else {
+	      // Basis: a guard conjunct evaluated false on the general path too,
+	      // not only when every primed variable was already assigned.
+	      return this.falseGuard(s0, action, s1, pred, c, nss);
 	    }
 	    return resState;
 	  }

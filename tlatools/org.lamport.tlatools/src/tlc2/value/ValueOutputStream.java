@@ -15,7 +15,7 @@ import util.BufferedDataOutputStream;
 public final class ValueOutputStream implements IValueOutputStream {
 
   private final BufferedDataOutputStream dos;
-  private final HandleTable handles;
+  private HandleTable handles;
 
   public ValueOutputStream(File file) throws IOException {
 	  this(file, TLCGlobals.useGZIP);
@@ -69,6 +69,16 @@ public final class ValueOutputStream implements IValueOutputStream {
   @Override
   public final void close() throws IOException {
     this.dos.close();
+  }
+
+  /**
+   * Basis: flush what was written and forget its handles, so the next value
+   * is encoded on its own and one stream can serialise many states that are
+   * later decoded separately.
+   */
+  public final void reset() throws IOException {
+    this.dos.flush();
+    this.handles = new HandleTable();
   }
   
   /* Precondition: x is a non-negative short. */

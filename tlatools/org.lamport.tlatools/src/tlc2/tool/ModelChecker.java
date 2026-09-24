@@ -509,7 +509,9 @@ public class ModelChecker extends AbstractChecker
                         {
 							MP.printError(EC.TLC_INVARIANT_VIOLATED_BEHAVIOR,
 									tool.getInvNames()[k]);
-							this.trace.printTrace(curState, succState);
+							if (TLCGlobals.continuationTraceAllowed(tool.getInvNames()[k])) {
+								this.trace.printTrace(curState, succState);
+							}
 							return false;
                         }
                 	} else {
@@ -541,7 +543,9 @@ public class ModelChecker extends AbstractChecker
                         {
                             MP.printError(EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR, tool
                                     .getImpliedActNames()[k]);
-							this.trace.printTrace(curState, succState);
+							if (TLCGlobals.continuationTraceAllowed(tool.getImpliedActNames()[k])) {
+								this.trace.printTrace(curState, succState);
+							}
 							return false;
                        }
                     } else {
@@ -696,7 +700,7 @@ public class ModelChecker extends AbstractChecker
 			return EC.NO_ERROR;
 		}
    	
-        if (this.theStateQueue.suspendAll())
+        if (this.periodicSuspend())
         {
             // Run liveness checking, if needed:
 			// The ratio set in TLCGlobals defines an upper bound for the
@@ -724,7 +728,7 @@ public class ModelChecker extends AbstractChecker
             	checkpoint();
             } else {
 				// Just resume worker threads when checkpointing is skipped
-            	this.theStateQueue.resumeAll();
+            	this.periodicResume();
             }
         }
         return EC.NO_ERROR;
@@ -743,7 +747,7 @@ public class ModelChecker extends AbstractChecker
 		}
 		// Resume the workers' state-space exploration, which potentially mutates
 		// the intern table and liveness graph.
-		this.theStateQueue.resumeAll();
+		this.periodicResume();
 		// commit checkpoint:
 		this.theStateQueue.commitChkpt();
 		this.trace.commitChkpt();
@@ -1057,16 +1061,71 @@ public class ModelChecker extends AbstractChecker
 		}
 	}
 	
+	/**
+	 * True while a caller of {@link #suspend()} holds the workers parked. The
+	 * periodic work (checkpoints, liveness checks) suspends and resumes the
+	 * queue on its own; it must not resume workers someone else has parked.
+	 */
+	private boolean held = false;
+	/** True while the periodic work has the workers parked. */
+	private boolean periodicParked = false;
+	/**
+	 * Held by whoever waits in {@code theStateQueue.suspendAll()}. The queue
+	 * wakes a single waiter when the last worker parks, so a second thread
+	 * waiting there at the same time (the periodic work and a caller of
+	 * {@link #suspend()}) would never be woken. Not the checker's monitor:
+	 * workers take that on their way to the barrier.
+	 */
+	private final Object suspendLock = new Object();
+
+	private boolean suspendQueue() {
+		synchronized (this.suspendLock) {
+			return this.theStateQueue.suspendAll();
+		}
+	}
+
+	private boolean periodicSuspend() {
+		synchronized (this) {
+			this.periodicParked = true;
+		}
+		final boolean suspended = this.suspendQueue();
+		if (!suspended) {
+			synchronized (this) {
+				this.periodicParked = false;
+			}
+		}
+		return suspended;
+	}
+
+	private void periodicResume() {
+		synchronized (this) {
+			this.periodicParked = false;
+			if (!this.held) {
+				this.theStateQueue.resumeAll();
+			}
+		}
+	}
+
 	public void suspend() {
 		synchronized (this) {
-			this.theStateQueue.suspendAll();
+			this.held = true;
+		}
+		// Basis: wait for the workers outside this monitor. A worker reporting
+		// a violation (or the end of the run) takes it before it can reach the
+		// queue's barrier, so waiting while holding it deadlocks.
+		this.suspendQueue();
+		synchronized (this) {
 			this.notifyAll();
 		}
 	}
 
 	public void resume() {
 		synchronized (this) {
-			this.theStateQueue.resumeAll();
+			this.held = false;
+			// Periodic work in progress resumes the workers when it is done.
+			if (!this.periodicParked) {
+				this.theStateQueue.resumeAll();
+			}
 			this.notifyAll();
 		}
 	}
@@ -1088,6 +1147,11 @@ public class ModelChecker extends AbstractChecker
 	/* (non-Javadoc)
 	 * @see tlc2.tool.AbstractChecker#getStateQueueSize()
 	 */
+	/** The workers of the current run, for their statistics; empty before it. */
+	public IWorker[] getWorkers() {
+		return this.workers == null ? new IWorker[0] : this.workers;
+	}
+
 	@Override
 	public long getStateQueueSize() {
 		return theStateQueue.size();
@@ -1179,6 +1243,10 @@ public class ModelChecker extends AbstractChecker
 							liveCheck.addInitState(tool.noDebug(), curState, fp);
 						}
 					}
+				} else {
+					// Basis: its invariants are checked below, so a writer
+					// that sweeps invariants later needs it too.
+					allStateWriter.writeExcludedInitial(curState);
 				}
 				// Check properties of the state:
 				if (!seen || forceChecks) {

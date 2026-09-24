@@ -286,6 +286,16 @@ public final class Worker extends IdThread implements IWorker, INextStateFunctor
 	 * cache in BufferedRandomAccessFile hasn't been flushed out.
 	 */
 	
+	/**
+	 * Close this worker's trace file. A run's cleanup closes the shared trace
+	 * but not the workers' files; a process that exits never notices, but one
+	 * that outlives its run (the resident) must close them before it can
+	 * delete the metadir on Windows.
+	 */
+	public final synchronized void closeTrace() throws IOException {
+		this.raf.close();
+	}
+
 	public final synchronized void writeState(final TLCState initialState, final long fp) throws IOException {
 		// Write initial state to trace file.
 		this.lastPtr = this.raf.getFilePointer();
@@ -494,7 +504,7 @@ public final class Worker extends IdThread implements IWorker, INextStateFunctor
 	public TLCState addUnsatisfiedState(final TLCState curState, final Action action, final TLCState succState,
 			final SemanticNode pred, final Context c) {
 		if (this.allStateWriter.isConstrained()) {
-			this.allStateWriter.writeState(curState, succState, IStateWriter.IsNotInModel, action, pred);
+			this.allStateWriter.writeUnsatisfied(curState, action, succState, pred, c);
 		}
 		return succState;
 	}	
@@ -559,7 +569,9 @@ public final class Worker extends IdThread implements IWorker, INextStateFunctor
                         {
 							MP.printError(EC.TLC_INVARIANT_VIOLATED_BEHAVIOR,
 									this.tool.getInvNames()[k]);
-							this.tlc.trace.printTrace(curState, succState);
+							if (TLCGlobals.continuationTraceAllowed(this.tool.getInvNames()[k])) {
+								this.tlc.trace.printTrace(curState, succState);
+							}
 							return false;
                         }
                 	} else {
@@ -591,7 +603,9 @@ public final class Worker extends IdThread implements IWorker, INextStateFunctor
                         {
                             MP.printError(EC.TLC_ACTION_PROPERTY_VIOLATED_BEHAVIOR, this.tool
                                     .getImpliedActNames()[k]);
-                            this.tlc.trace.printTrace(curState, succState);
+                            if (TLCGlobals.continuationTraceAllowed(this.tool.getImpliedActNames()[k])) {
+                                this.tlc.trace.printTrace(curState, succState);
+                            }
 							return false;
                        }
                     } else {

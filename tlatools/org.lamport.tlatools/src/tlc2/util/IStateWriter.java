@@ -65,6 +65,30 @@ public interface IStateWriter {
 
 	void writeState(TLCState state, TLCState successor, short stateFlags, Action action, SemanticNode pred);
 
+	/**
+	 * An initial state that a state constraint excludes from the model. TLC
+	 * checks invariants and state-level properties on it but never explores
+	 * it. The default ignores it, as upstream writers always have.
+	 */
+	default void writeExcludedInitial(TLCState state) {
+	}
+
+	/**
+	 * A guard conjunct {@code pred} of {@code action} evaluated false at
+	 * {@code state} under the bindings in {@code c}, so the transition to
+	 * {@code successor} was not taken. Delivered only to a constrained writer.
+	 * {@code successor} may have unassigned variables (a guard can fail before
+	 * any primed variable is assigned). The default keeps the older behaviour:
+	 * it drops the context and forwards only a fully assigned successor, the
+	 * only kind upstream writers ever received here.
+	 */
+	default void writeUnsatisfied(TLCState state, Action action, TLCState successor, SemanticNode pred,
+			tlc2.util.Context c) {
+		if (successor != null && successor.allAssigned()) {
+			writeState(state, successor, IsNotInModel, action, pred);
+		}
+	}
+
 	void writeState(TLCState state, TLCState successor, short stateFlags, Visualization visualization);
 	
 	void writeState(TLCState state, TLCState successor, BitVector actionChecks, int from, int length, short stateFlags);

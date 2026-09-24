@@ -61,6 +61,14 @@ public abstract class AbstractChecker
     protected TLCState predErrState;
     protected TLCState errState;
     protected int errorCode;
+    /**
+     * Basis: every code {@link #setErrState} or {@link #setError} accepted, in
+     * order. Under continuation a later code overwrites {@link #errorCode}
+     * (a next-state evaluation error is followed by the deadlock of the state
+     * whose expansion it aborted), so the code the run ends on need not name
+     * every error it hit. Guarded by this checker's monitor.
+     */
+    private final List<Integer> errorCodes = new ArrayList<>();
     protected boolean done;
     protected boolean keepCallStack;
     protected final boolean checkDeadlock;
@@ -177,15 +185,22 @@ public abstract class AbstractChecker
         this.predErrState = curState;
         this.errState = (succState == null) ? curState : succState;
         this.errorCode = errorCode;
+        this.errorCodes.add(errorCode);
         this.done = true;
         this.keepCallStack = keepCallStack;
         return true;
     }
 
+	/** Basis: every error code this run set, in order (see {@link #errorCodes}). */
+	public synchronized List<Integer> getErrorCodes() {
+		return new ArrayList<>(this.errorCodes);
+	}
+
 	public void setError(boolean keepCallStack, int errorCode) {
 		assert Thread.holdsLock(this) : "Caller thread has to hold monitor!";
 		IdThread.resetCurrentState();
 		this.errorCode = errorCode;
+		this.errorCodes.add(errorCode);
 		this.done = true;
 		this.keepCallStack = keepCallStack;
 	}
