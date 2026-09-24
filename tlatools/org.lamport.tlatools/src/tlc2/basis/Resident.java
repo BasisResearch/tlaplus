@@ -160,6 +160,8 @@ public final class Resident {
 	 */
 	private boolean everContinued;
 	private String metadir;
+	/** The metadir the session's own run was given at open; a refresh moves {@link #metadir} on. */
+	private String runMetadir;
 	private volatile Integer resultCode;
 	private volatile Throwable checkerFailure;
 	private long openedAt;
@@ -366,6 +368,7 @@ public final class Resident {
 			TLCGlobals.coverageInterval = coverage ? Integer.MAX_VALUE : -1;
 			FP64.Init(fpIndex);
 			metadir = FileUtil.makeMetaDir(new Date(openedAt), specDir, null);
+			runMetadir = metadir;
 			tool = new FastTool(mainFile, config, new SimpleFilenameToStream(specDir), Tool.Mode.MC,
 					new HashMap<>());
 			runTool = tool;
@@ -426,6 +429,7 @@ public final class Resident {
 			FP64.Init(0);
 			tlc2.value.RandomEnumerableValues.setSeed(seed);
 			metadir = FileUtil.makeMetaDir(new Date(openedAt), specDir, null);
+			runMetadir = metadir;
 			tool = new FastTool(mainFile, config, new SimpleFilenameToStream(specDir), Tool.Mode.Simulation,
 					new HashMap<>());
 			runTool = tool;
@@ -1849,6 +1853,29 @@ public final class Resident {
 			}
 			baseStore = null;
 			store = null;
+			// TLC deletes its run's metadir when the run ends, but on Windows
+			// a file another process still holds (a virus scanner) makes that
+			// fail; the session created the directory, so it finishes the job.
+			if (runMetadir != null) {
+				deleteTree(new File(runMetadir));
+				final File root = new File(runMetadir).getParentFile();
+				final String[] left = root == null ? null : root.list();
+				if (left != null && left.length == 0) {
+					GraphStore.delete(root);
+				}
+			}
+		}
+	}
+
+	private static void deleteTree(final File f) {
+		final File[] children = f.listFiles();
+		if (children != null) {
+			for (final File c : children) {
+				deleteTree(c);
+			}
+		}
+		if (f.exists()) {
+			GraphStore.delete(f);
 		}
 	}
 

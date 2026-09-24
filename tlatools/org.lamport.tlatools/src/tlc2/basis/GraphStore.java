@@ -449,7 +449,7 @@ public final class GraphStore implements IStateWriter {
 	 * scanner, the indexer) can hold a freshly written file open for a moment,
 	 * and the delete fails until it lets go. Left to the JVM's exit otherwise.
 	 */
-	private static void delete(final File f) {
+	static void delete(final File f) {
 		for (int attempt = 0; attempt < 20; attempt++) {
 			if (f.delete() || !f.exists()) {
 				return;
