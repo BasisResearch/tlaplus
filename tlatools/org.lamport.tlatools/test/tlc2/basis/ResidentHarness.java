@@ -50,8 +50,12 @@ final class ResidentHarness {
 		Files.write(dir.resolve(name), text.getBytes(StandardCharsets.UTF_8));
 	}
 
-	Path spec(final String module) {
-		return dir.resolve(module + ".tla");
+	/**
+	 * The module's path, escaped for a JSON string literal: tests splice it
+	 * into request text, and a Windows path's backslashes are escapes there.
+	 */
+	String spec(final String module) {
+		return dir.resolve(module + ".tla").toString().replace("\\", "\\\\");
 	}
 
 	/** Serve {@code json}; the reply must be ok. */
